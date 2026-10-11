@@ -65,6 +65,7 @@ crispasr 侧全部是"下载即终件"，ONNX 侧有两件（`punc.f32.onnx`、`
 | `ASR_PRIMARY_LEG` | `onnx` | 主力那一路由谁跑：`onnx` / `crispasr`（见第 6 节） |
 | `FIREDASR_ONNX_MODELS_DIR` | `./onnx/models` | ONNX 三件权重的根目录 |
 | `FIREDASR_ONNX_PROVIDER` | `cuda` | ONNX 的执行提供者：`cpu` / `cuda`。**只有这两个值**，见第 6 节那条"只用 N 卡"。没有 CUDA EP 的机器要显式给 `cpu`，否则起批前当场停 |
+| `FIREDASR_GPU_PY` | 空 = 不换 | 装了 CUDA EP 的那个解释器的绝对路径。非空时驱动在起批前先看**当前解释器**有没有 `CUDAExecutionProvider`，没有就用它把自己原地重启一次（只一次，靠 `FIREDASR_GPU_PY_SWITCHED` 记账防循环）。出厂留空：仓库里不写机器专属路径，见 §6.3 |
 | `FIREDASR_ONNX_GRAPH` | `mixed` | AED 图形状，必须与建权重时 `--graph` 给的那个一致 |
 
 六份 crispasr 侧权重的文件名分别写在 `CRISPASR_MODEL_AED` / `CRISPASR_MODEL_QWEN3` /
@@ -83,6 +84,13 @@ crispasr 侧全部是"下载即终件"，ONNX 侧有两件（`punc.f32.onnx`、`
 
 **关掉启动它的那个控制台 = 连坐杀 crispasr 子进程**（Job Object 是故意绑上去的，
 用来防孤儿）。要停就用 `--stop`，别关窗。
+
+**仓库这份是出厂形态**：default 全部相对包目录、env 优先，正文里没有一条机器专属路径。
+笔记本桌面上那份（和校机分发包里那份）= 同一套代码，只把 default 换成那台机器的绝对路径、
+注释里的 `<输出目录>` / `<音频根>` 记号换成实际目录。所以逻辑改动只改仓库这份，再往机器副本
+重刷 default；反过来在副本里改逻辑，仓库后续的修正会静默丢掉（10-12 就对过一次性：桌面那四份
+是 10-10 01:04 复制的，缺了之后的 20 s 分块、`GATE_LID_SEC` 定案、KV cache 说法更正和本节的
+`GPU_PY`，已按上面这个口径重生成）。
 
 I/O 契约（与 `CrispASR-Qwen/`、`cpu` 分支那两份逐条相同）：
 
@@ -156,6 +164,7 @@ I/O 契约（与 `CrispASR-Qwen/`、`cpu` 分支那两份逐条相同）：
 | `BATCH_SIZE` | `28` | 一次调用喂多个 `-f`，模型/VAD 只加载一次 |
 | `PRIMARY_LEG` | `"onnx"` | 主力那一路由谁跑（第 6 节）。改 `"crispasr"` 就回到 10-09 之前的形状 |
 | `ONNX_PROVIDER` | `"cuda"` | ONNX 的执行提供者，**只认 `cpu` / `cuda`**。写别的（DirectML、OpenVINO）驱动直接退出 —— 那两个能挑中 AMD 核显。出厂值 10-09 从 `cpu` 改成 `cuda`（同一批三件实测 cuda RTF 0.427 对纯 CPU 0.566，§6.6）。**没有 CUDA EP 的机器现在会当场停在起批前那道 `enc_ep` 断言**，要在那种机器上跑得显式给 `FIREDASR_ONNX_PROVIDER=cpu` |
+| `GPU_PY` | `""`（不换） | 会话在本进程常驻（不外包子进程），所以"编码器在不在卡上"取决于**现在跑这份脚本的那个 python 里的 onnxruntime**。一台机器上常见"装 CUDA EP 的 ORT 在某个 venv 里，而双击 / 计划任务用的是另一个解释器"，这一步就是给那种情形留的：起批前换一次解释器，换完仍不起 CUDA 照旧停在 `enc_ep` 断言上。判据是纯函数 `should_switch_interpreter()`（只在无参数、`--start`、`--bg`、`/start` 这四条路上问 EP，`--stop` / `--help` / `crispasr` 主腿 / `provider=cpu` 一行 ORT 都不 import），逐条见 §6.3 |
 | `ONNX_GRAPH` | `"mixed"` | f32 编码器 + int8 解码器。10-06 产线实测最快的那档，也是 `cuda` 下唯一有意义的选择（int8 图里那些整型算子 CUDA EP 跑不了） |
 | `ONNX_DEC_ON_GPU` | `False` | 编码器上卡、解码器留 CPU。10-09 在 N 卡上实测：解码器也上卡**更慢**（整批 418.9 s → 537.2 s，+28%），显存倒是放得下（峰值 4,788 MiB / 8,188 MiB）。机制与 crispasr 那边同源结论见 §5.1，数值见 §6.6 |
 | `ONNX_ASR_THREADS` / `ONNX_VAD_THREADS` / `ONNX_PUNC_THREADS` | 逻辑核一半 / ≤8 / 4 | 与 `cpu` 分支那个分发包同口径（10-06 实测并回去的） |
@@ -359,6 +368,18 @@ I/O 契约（与 `CrispASR-Qwen/`、`cpu` 分支那两份逐条相同）：
 * **建完会话读 `get_providers()` 验一次**：`ONNX_PROVIDER="cuda"` 而 `enc_ep` 里没有
   `CUDAExecutionProvider` 就抛错。CUDA/cuDNN 运行库不齐时 ORT 只打一行警告就把整个会话
   退回 CPU，不读实际结果就是"说好用 N 卡、实际在 CPU 上跑一整夜"而没人看得出来。
+* **起批前换一个解释器（`GPU_PY`，10-12 加）**：同一台机器上两个解释器的读数实测差得很干脆 ——
+  系统 python 里的 ORT 1.24.2 只列 `AzureExecutionProvider / CPUExecutionProvider`，另一个装了
+  `onnxruntime-gpu` 1.30.0 的 venv 列 `TensorrtExecutionProvider / CUDAExecutionProvider /
+  CPUExecutionProvider`（10-12 本机各跑一次 `get_available_providers()`）。上一条断言过不过，
+  完全由"这份脚本被哪个 python 起了"决定，所以驱动在起批前自己处理：`GPU_PY` 非空 + 当前解释器
+  没有 CUDA EP → `os.execv` 原地换成那个解释器重启一次（记账位 `FIREDASR_GPU_PY_SWITCHED=1`
+  防循环，实测换完 `sys.executable` 就是目标解释器、再判一次返回不动）。三条边界：
+  ①**换解释器不等于换硬件**，只解决"用错了 python"，CUDA/cuDNN DLL 不齐那种"编译列表里列得出
+  CUDA 却起不动"不由这一步兜，还是 `enc_ep` 断言停；②Windows 的 `os.execv` 走 MSVCRT、给参数
+  拼命令行时不加引号，所以解释器或脚本路径含空格时**不换**（停在断言上比"换了个 python 结果它说
+  找不到脚本"好读）；③出厂 `GPU_PY` 是空串 —— 仓库里不写任何机器专属路径，谁在机器上跑谁用
+  `FIREDASR_GPU_PY` 给，或像桌面副本那样把 default 写成那台机器的路径。
 
 显存与解码器上不上卡：默认 `ONNX_DEC_ON_GPU = False`（编码器上卡、解码器留 CPU）。
 10-09 在 N 卡上自己测过（§6.6）：**放不下不是理由** —— 编码器 + int8 解码器都上卡时峰值

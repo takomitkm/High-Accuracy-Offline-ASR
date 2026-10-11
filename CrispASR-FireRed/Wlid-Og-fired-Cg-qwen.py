@@ -717,6 +717,19 @@ ONNX_PUNC_FILE = os.environ.get("FIREDASR_ONNX_PUNC_FILE", "")   # 空 = 先 pun
 # 也就是说【没有 CUDA EP 的机器现在会当场停】,要在这种机器上跑得显式
 # FIREDASR_ONNX_PROVIDER=cpu。宁可停,也不要"以为在显卡上跑其实是 CPU"。
 ONNX_PROVIDER = (os.environ.get("FIREDASR_ONNX_PROVIDER") or "cuda").strip().lower()
+# ---------- 起批前换一个解释器(GPU_PY) ----------
+# 这条链的会话是在本进程里常驻的(不外包子进程),所以"编码器在不在卡上"取决于【现在跑我的
+# 这个 python 里的那个 onnxruntime】。一台机器上常见的情形是:装 CUDA EP 的 ORT 在某个
+# venv 里,而 shebang/双击/计划任务用的是另一个解释器 —— 那种情况下上一段那条
+# enc_ep 断言会当场把批次停在起批前(设计如此,不偷偷退回 CPU)。
+# GPU_PY 就是给这种情况留的一步:非空时,脚本在起批前先看当前解释器有没有
+# CUDAExecutionProvider,没有就用这个解释器把自己原地重启一次(只一次,靠
+# FIREDASR_GPU_PY_SWITCHED 记账防循环)。换过之后还不起 CUDA,就仍然落回断言 ——
+# 换解释器不等于换硬件,它只解决"用错了 python"这一件事。
+# 注:get_available_providers() 报的是【编译进来的 EP 清单】,CUDA DLL 不齐时它照样列
+# CUDA,所以这一步判不出"缺运行库"那种坏 —— 那种坏还是由 enc_ep 断言兜。
+# 出厂值是空的:仓库里不写任何机器专属路径。装了 CUDA EP 的机器上这一段整体不触发。
+GPU_PY = (os.environ.get("FIREDASR_GPU_PY") or "").strip()
 # 图形状:int8 = 官方量化图(对拍背书,但 CUDA EP 跑不了那些整型算子);
 # mixed = f32 编码器 + int8 解码器(实测最快,也是 cuda 档唯一有意义的选择);
 # f32   = 全逆量化(最占内存)。
@@ -2393,10 +2406,85 @@ def cmd_stop() -> int:
     return 0
 
 
+# ==================== 起批前换解释器(GPU_PY) ====================
+#
+# 判据与动作分开放:should_switch_interpreter() 是纯函数(只看传进去的五个值,不碰环境、
+# 不 import 任何东西),逐条判据能单独核对;"当前解释器到底有没有 CUDA EP"这一问要
+# import onnxruntime,所以留在动作函数里,而且排在全部便宜判据之后 —— 这样 --help /
+# --stop / PRIMARY_LEG=crispasr / provider=cpu / 没设 GPU_PY 这几条路一行 ORT 都不碰。
+
+def should_switch_interpreter(arg, gpu_py, primary_leg, provider, switched):
+    """五个输入定生死,没有副作用。返回要换成的解释器路径,或 None(不动)。"""
+    if not gpu_py:
+        return None
+    if arg not in ("", "--start", "--bg", "/start"):
+        return None
+    if primary_leg != "onnx" or provider != "cuda":
+        return None
+    if switched:
+        return None
+    return gpu_py
+
+
+def current_has_cuda_ep():
+    """问一句当前解释器的 onnxruntime 支持哪些 EP;import 失败按"没有 CUDA"处理。"""
+    try:
+        import onnxruntime
+    except Exception as exc:
+        sys.stderr.write(f"当前解释器 import onnxruntime 失败:{exc!r}\n")
+        sys.stderr.flush()
+        return False
+    try:
+        return "CUDAExecutionProvider" in onnxruntime.get_available_providers()
+    except Exception as exc:
+        sys.stderr.write(f"get_available_providers() 失败:{exc!r}\n")
+        sys.stderr.flush()
+        return False
+
+
+def switch_interpreter_if_needed(arg):
+    target = should_switch_interpreter(
+        arg, GPU_PY, PRIMARY_LEG, ONNX_PROVIDER,
+        os.environ.get("FIREDASR_GPU_PY_SWITCHED") == "1",
+    )
+    if target is None:
+        return
+    if current_has_cuda_ep():
+        return
+    exe = os.path.abspath(target)
+    if not os.path.isfile(exe):
+        sys.stderr.write(f"GPU_PY 指向的解释器不存在:{exe} —— 不换,继续用 {sys.executable},"
+                         "后面 enc_ep 断言该停还是会停\n")
+        sys.stderr.flush()
+        return
+    try:
+        same = os.path.samefile(exe, os.path.abspath(sys.executable))
+    except OSError:
+        same = False
+    if same:
+        sys.stderr.write(f"GPU_PY 就是当前解释器({exe}),没有可换的 —— 后面该停还是会停\n")
+        sys.stderr.flush()
+        return
+    script = os.path.abspath(__file__)
+    if " " in exe or " " in script:
+        # Windows 的 os.execv 走 MSVCRT,给参数拼命令行时不加引号,带空格的路径会被切成两个
+        # 参数 —— 表现是"换了个解释器结果它说找不到脚本",比停在起批前更难懂,所以不换。
+        sys.stderr.write("解释器或脚本路径带空格,execv 在 Windows 上会拼坏参数 —— 不换,"
+                         "把本文件放到无空格目录再让 GPU_PY 生效\n")
+        sys.stderr.flush()
+        return
+    sys.stderr.write(f"当前解释器 {sys.executable} 没有 CUDAExecutionProvider,"
+                     f"改用 {exe} 重新启动(只换这一次)\n")
+    sys.stderr.flush()
+    os.environ["FIREDASR_GPU_PY_SWITCHED"] = "1"
+    os.execv(exe, [exe, script] + sys.argv[1:])
+
+
 # ==================== ENTRY ====================
 
 if __name__ == "__main__":
     _arg = (sys.argv[1] if len(sys.argv) > 1 else "").lower()
+    switch_interpreter_if_needed(_arg)
     _USAGE = ("用法: python Wlid-Og-fired-Cg-qwen.py [--start | --stop]\n"
               "  (无参数)  前台转写整个队列\n"
               "  --start   后台转写(控制台输出 -> txt\\log\\console_*.log)\n"
