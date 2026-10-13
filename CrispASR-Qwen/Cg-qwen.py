@@ -109,8 +109,8 @@ CRISPASR_LID_MODEL = os.path.join(MODEL_DIR, "ggml-tiny.bin")
 # 差异只在断句与标点,没有内容进出。n=1,B 级。
 # 【已知洞:v6 对唱歌素材判 0 段、整条静默丢弃】(一条 60 s 日推歌曲副歌:rc 仍 0、
 # 不落 .txt;v5 捡回 59 字,firered 出 97 字真歌词)⇒ "口语打平"不等于"全语料打平"。
-# 这份仍留 silero;完整账与 firered 的代价见 Wlid-Og-fired-Cg-qwen.py 的 CONFIG · VAD,无语音文件的
-# 记账(no_speech.txt)由 Wlid-Og-fired-Cg-qwen.py 和 Cc-qwen.py 两份负责,这份不改逻辑。
+# 这份仍留 silero;完整账与 firered 的代价见同仓 ../CrispASR-FireRed/Flid-Cg-firered-Cg-qwen.py 的 CONFIG · VAD,无语音文件的
+# 记账(no_speech.txt)由 ../CrispASR-FireRed/Flid-Cg-firered-Cg-qwen.py 和 Cc-qwen.py 两份负责,这份不改逻辑。
 CRISPASR_VAD_MODEL = os.path.join(MODEL_DIR, "ggml-silero-v6.2.0.bin")
 
 # ==================== CONFIG · CrispASR ====================

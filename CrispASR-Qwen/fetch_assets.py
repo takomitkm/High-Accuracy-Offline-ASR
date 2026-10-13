@@ -277,7 +277,12 @@ def main():
         overrides[k] = v
     roots = resolve_roots(manifest, overrides)
     only = set(args.only.split(",")) if args.only else None
-    ua = f"my-asr-toolchain-{manifest['engine']}/fetch_assets"
+    # UA 必须是 latin-1 编得出的纯 ASCII：manifest['engine'] 里有中文和全角括号，直接
+    # 塞进去 urllib 会在【发请求那一步】抛 UnicodeEncodeError('latin-1' can't encode
+    # character '\uff08')，一个字节都下不下来（10-14 本机 python -m http.server 复现）。
+    # 改用本包目录名识别链条，它是 ASCII。
+    pkg = os.path.basename(os.path.dirname(os.path.abspath(__file__)))
+    ua = f"High-Accuracy-Offline-ASR-{pkg}-fetch_assets"
     OP = urllib.request.build_opener(
         urllib.request.ProxyHandler({"http": args.proxy, "https": args.proxy})
         if args.proxy else urllib.request.ProxyHandler())

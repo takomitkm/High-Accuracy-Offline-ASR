@@ -194,7 +194,7 @@ CUDA 侧的行为差异只在 `CRISPASR_GPU_BACKEND` 这一个开关和 `ggml-cu
 - **silero v6.2.0 对唱歌素材判 0 段 → 整条静默丢弃**（rc 仍为 0、不落 `.txt`）。
   口语素材上 v5/v6 打平（同一份 89.84 s 中文：切 5 段/75.78 s 对 7 段/75.88 s，墙钟
   55.9 对 56.1 s），但"口语打平"不等于"全语料打平"。**而且这份驱动不写 `no_speech.txt`**
-  ——记账逻辑在 `Wlid-Og-fired-Cg-qwen.py` 和 CPU 版那份里，这份不改（驱动 CONFIG 一节末尾那条注释就写着这件事）。
+  ——记账逻辑在 `../CrispASR-FireRed/Flid-Cg-firered-Cg-qwen.py` 和 CPU 版那份里，这份不改（驱动 CONFIG 一节末尾那条注释就写着这件事）。
   要吞了多少的账，用 `CrispASR-FireRed/` 那份驱动跑，或换 `firered-vad.gguf`。
 - `--stop` / STOP 文件是**批边界**退出，一批最长可能等 `BATCH_SIZE` × 单文件时长。
 - MSVC 4 件和（GPU 档才需要的）CUDA 运行库是两处人工门槛；前者 rc=127 已实测，

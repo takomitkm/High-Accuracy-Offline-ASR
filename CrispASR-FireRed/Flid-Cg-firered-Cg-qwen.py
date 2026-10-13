@@ -1,7 +1,9 @@
 r"""
 CrispASR 批量转写驱动(Windows) —— FireRed AED 主引擎 + qwen3 兜底,由 Cg-qwen.py 复制而来
-(本名按仓库根 README 的记号法拆:Wlid 判语种 -> Og-fired 主链 -> Cg-qwen 兜底;
- 旧名 crisper-xhs-qwen-asr.py,10-08 前还叫 xhs-asr.py,三份是同一个文件)
+(本名按仓库根 README 的记号法拆:Flid 判语种 -> Cg-fired 主链 -> Cg-qwen 兜底;
+ 旧名 crisper-xhs-qwen-asr.py,10-08 前还叫 xhs-asr.py,三份是同一个文件;
+ 10-10~10-14 期间叫 Wlid-Og-fired-Cg-qwen.py —— 那版默认主链是 onnx、筛子是 whisper-tiny,
+ 现在两件都翻回来了:默认主链 crispasr、筛子 FireRedLID)
 
 本文件与 Cg-qwen.py 的差异在引擎组合、VAD、标点、语种处理和"换引擎"这件事由谁
 来做这几处;队列、硬链接暂存、批内结算、单实例锁、Job Object、通知全部原样沿用。
@@ -12,7 +14,7 @@ CrispASR 批量转写驱动(Windows) —— FireRed AED 主引擎 + qwen3 兜底
     这条路慢:本机实测 RTF 0.93 对 qwen3 的 0.19)。
   · 语种是它唯一的短板,所以本副本【两台引擎都装】,按语种分工:
       主 aed    —— 默认所有文件走它
-      兜底 qwen3 —— 只接 whisper-tiny 前置判别(CRISPASR_LID_BACKEND="whisper")判到
+      兜底 qwen3 —— 只接 FireRedLID 前置判别(CRISPASR_LID_BACKEND="firered")判到
                     AED 覆盖范围外的文件
     为什么必须换引擎而不是改参数:AED 自带 LID 头,覆盖 中文(+约20种汉语方言)/ 英语 /
     粤语,没有日语这类位置,而且适配器源码明写"offers no per-request language override,
@@ -35,11 +37,26 @@ CrispASR 批量转写驱动(Windows) —— FireRed AED 主引擎 + qwen3 兜底
       语种结论与文件的对应靠"批量循环是单线程顺序跑的"(crispasr_run.cpp:4974-4981),
       并额外处理两类错位:读音频就失败的文件(它不产生判别行,但 error 行带路径)和
       走到判别却没出码的文件(占一个槽位)。对不上号时整批【不采信】筛子。
-  · 筛子的失手方式要知道:whisper-tiny 只看【前 15 秒原始音频】、whisper 路径【没有置信度
-    闸门】,lidbench 上它的召回是 中文 5/6、日语 2/4。所以【假阴性会漏】—— 判成 zh 的外语
-    文件仍会被 AED 编造一段话并正常落盘,这一层没有兜底;假阳性的代价只是白跑一遍 qwen3
-    (它反而快 5 倍)。前置判别每文件都要重装一次 whisper-tiny(crispasr_run.cpp:1021 的
-    crispasr_lid_free_cache() 是 #35 显存修补),耗时按实测落在抖动里(见 CONFIG · 语种 (5))。
+  · 筛子的失手方式要知道(换成 FireRedLID 之后,下面这几条是读源码得来的,不是推测):
+      - 它只看【前 5 秒】。crispasr 的 LID 取的是原始音频前 15 秒(crispasr_lid.cpp:284),
+        FireRed 适配器再自己截到 5 秒(src/firered_lid.cpp:78)—— 比 whisper-tiny 那版筛子
+        的窗口【更短】,所以"前段是音乐前奏"这类失败形态只会更严重,不会缓解。
+      - p= 恒为 1.0(src/firered_lid.cpp:90 把 confidence 写死),所以【不可能加置信度闸门】,
+        判成什么就是什么。
+      - 它的词表是 120 个标签(读自 model/dict.txt),其中 "zh" 后面还带方言二词
+        (zh mandarin / zh xinan / zh min / zh wu / zh xiang / zh yue / zh north),
+        并且有一个真实的 "other" 类 —— 所以判到的码可能是两个 token,驱动必须按空白拆开
+        取头一个再判范围(_in_aed_range)。
+      - 【本语料上的召回率没有量过】。旧文档里"中文 5/6、日语 2/4"那是 whisper-tiny 在
+        lidbench 上的数字,不能挂到 FireRedLID 头上;换筛子之后这两条假阴性/假阳性率
+        属于未核(标 C)。所以【假阴性会漏】这条结论仍然保留,但漏多少不知道。
+    仍然成立的部分:判成 zh 的外语文件会被 AED 编造一段话并正常落盘,这一层没有兜底;
+    假阳性的代价只是白跑一遍 qwen3(它反而快 5 倍)。
+    前置判别每文件都要重装一次筛子模型(crispasr_run.cpp:1021 的 crispasr_lid_free_cache()
+    是 #35 显存修补)。代价变了:whisper-tiny 那份 77 MB,FireRedLID q4_k 这份 543 MB
+    —— 每文件重装的东西大了 7 倍,而【这个开销没有量过】,见 CONFIG · 语种。
+    它默认还占显存:firered_lid_init 走 firered_asr 的默认参数,那份参数里 use_gpu = true
+    (src/firered_asr.cpp:297)。
   · VAD 用 FireRedVAD(2,357,952 B)—— 小红书自家模型,FireRedASR2S 把唱歌算进 voice,
     所以它是三档里唯一不会把唱歌素材整条吞掉的那个;代价是口语素材上多约 31% 墙钟,
     而内容三家打平。两个引擎共用同一个 VAD,依据与实测见 CONFIG · VAD。
@@ -82,7 +99,7 @@ CrispASR 批量转写驱动(Windows) —— FireRed AED 主引擎 + qwen3 兜底
     模型、判别模型逐个 os.path.isfile 校验,缺哪个报哪个(全部字面路径集中在文件顶部
     CONFIG · 外部资源 那一段)。
 
-用法不变:python Wlid-Og-fired-Cg-qwen.py 前台跑 / --start 后台跑 / --stop 优雅停止。
+用法不变:python Flid-Cg-firered-Cg-qwen.py 前台跑 / --start 后台跑 / --stop 优雅停止。
 
 以下驱动行为原样继承 Cg-qwen.py(对比最早那版逐文件调用 crispasr 的脚本):
   · 一次 crispasr.exe 调用喂多个 -f,模型 / VAD 只加载一次(旧版每文件重载 1.7B 权重)
@@ -99,7 +116,7 @@ CrispASR 批量转写驱动(Windows) —— FireRed AED 主引擎 + qwen3 兜底
   · 规则文件按 "原词=替换词" 每行一条解析,单条非法正则只跳过该行
   · 语种一律 `-l auto`(CRISPASR_LANGUAGE),两个引擎都是 auto,不写死 zh。按目录名给
     语种的整套路由【整块删除】了(不是清空)—— 换引擎现在只由前置判别的结论决定。
-    前置判别器开着当筛子(CRISPASR_LID_BACKEND = "whisper" + LID_VERBOSE = True,
+    前置判别器开着当筛子(CRISPASR_LID_BACKEND = "firered" + LID_VERBOSE = True,
     后者是筛子的眼睛:判别行受 !no_prints 控制,关掉它筛子就瞎了)。逐条依据见
     CONFIG · 语种
   · 外部资源(可执行文件目录、两台引擎的权重、标点/判别/VAD 模型)的字面路径全部集中在
@@ -177,8 +194,14 @@ CRISPASR_MODEL_AED = os.path.join(MODEL_DIR, "firered-asr2-aed-q4_k.gguf")
 CRISPASR_MODEL_QWEN3 = os.path.join(MODEL_DIR, "qwen3-asr-1.7b-q8_0.gguf")
 # 书面标点后处理,【只给 AED 用】(qwen3 自己出标点,理由见 CONFIG · 引擎)。
 CRISPASR_PUNC_MODEL = os.path.join(MODEL_DIR, "fireredpunc-q8_0.gguf")
-# whisper-tiny 前置语种判别器(77,691,713 B)。当筛子用,见 CONFIG · 语种。
-CRISPASR_LID_MODEL = os.path.join(MODEL_DIR, "ggml-tiny.bin")
+# FireRedLID 前置语种判别器(firered-lid-q4_k.gguf,569,688,704 B)。当筛子用,
+# 见 CONFIG · 语种。同目录另有 f16/q8_0/q2_k 三档,换档只改这一行(哈希记在 assets.json)。
+CRISPASR_LID_MODEL = os.path.join(MODEL_DIR, "firered-lid-q4_k.gguf")
+# whisper-tiny(77,691,713 B)现在【只服务语种闸门的第二条腿】:PRIMARY_LEG="onnx" 时
+# 用 `-m 它 -dl` 判语种。原因是 `-dl` 那条早退只在 whisper 引擎里实现
+# (src/crispasr.cpp:7953-7970,detect 完直接 return 0),换 FireRedLID 做闸门判不了。
+# 默认 PRIMARY_LEG="crispasr" 时这条腿不跑,它就不是必需文件(启动校验按腿检查)。
+GATE_WHISPER_MODEL = os.path.join(MODEL_DIR, "ggml-tiny.bin")
 # VAD 权重 = FireRedVAD(小红书自家,voice 含唱歌)。firered-vad.gguf,2,357,952 B。
 # 选它是因为 silero v6.2.0 对唱歌素材判 0 段 → 整条静默丢弃(无 .txt、rc 仍为 0),
 # v5.1.2 只捡回 59 字,firered 出 97 字真歌词。详细数据与代价见 CONFIG · VAD。
@@ -219,7 +242,7 @@ EXTENSIONS = {".mp3", ".m4a", ".mp4", ".wav", ".oga", ".ogg", ".opus", ".flac", 
 # 方言)/ 英语 / 粤语,范围外【不是差一点,是拿汉字编造】,而且 -l 改不了它。所以:
 #
 #   主引擎  aed    —— 默认所有文件都走它
-#   兜底    qwen3  —— 只接前置筛子(CRISPASR_LID_BACKEND = whisper)判到 AED 范围外的文件
+#   兜底    qwen3  —— 只接前置筛子(CRISPASR_LID_BACKEND = firered)判到 AED 范围外的文件
 #
 # 换引擎这件事以前是"她自己切回 Cg-qwen.py 手工跑",现在由本脚本在同一批里自动
 # 完成:判到范围外的文件【不落盘】,攒下来立刻用 qwen3 重跑一遍(见 process_batch)。
@@ -477,7 +500,9 @@ CRISPASR_THREADS     = 6
 #     欧洲小语种码)—— crispasr 官方 README 里写着 "ecapa — recommended",但它是拿朗读/
 #     TTS 语料训的,唱歌直接出分布,那句 recommended 在本语料上不成立。firered-lid
 #     (887M 参数 Conformer,100+ 语种含 20+ 中文方言,模型卡自报 FLEURS-82 97.18%)
-#     按指示未测。
+#     这一轮(10-14)按她的指令换成了它 —— 但【本语料的召回仍然没有量过】,上面那批
+#     数字全是 whisper-tiny 的,挂不到 FireRedLID 头上;97.18% 是模型卡在 FLEURS-82
+#     上的自报数(标 C),不等于她的录音。要补测就跑 onnx/ 那套对拍,不在本轮范围。
 #
 # (5) 判别的耗时别当理由:45 s 组量到 +1.8 s/文件,120 s 组不复现(逐文件差 −0.5 到
 #     −1.7 s,判别反而略快),落在抖动里。所以"LID 有害"只剩内容层面的理由。
@@ -495,9 +520,14 @@ CRISPASR_THREADS     = 6
 #     片头那 15 秒,人声在第 15-30 秒才进来。注意方向:闸门读的是 whisper 后端自己那行
 #     auto-detected language,窗口是【30 秒】,不受这个 15 秒截断约束(逐条数字见
 #     README.md §6.6)。
+#     ⇒ 换成 FireRedLID 之后这个窗口【更短】:15 秒截断之后 FireRed 适配器自己再截到
+#     【5 秒】(src/firered_lid.cpp:78),所以"片头音乐把语种定错"这条最主要的失手点
+#     在新筛子上只会更严重。那条 head15/head30 对拍是 whisper-tiny 的,新筛子没做过。
 #
 # (7) 没有置信度闸门:CRISPASR_SILERO_LID_MIN_LOGIT 只作用于 silero。whisper 路径实测
 #     判到 p=0.395(中文播客判成 en)也照样往下走,没法"判得不确信就当没说"。
+#     FireRedLID 更彻底:它把 confidence 写死成 1.0(src/firered_lid.cpp:90),日志里那行
+#     p=1.000 恒真,【结构上不可能加置信度闸门】。
 #
 # (8) 判别结果在生产日志里看不见:`crispasr[lid]: detected 'xx' (p=…)` 与 CLI 那行
 #     `crispasr: LID -> language = …` 都受 opts.verbose = !params.no_prints 控制,而
@@ -522,23 +552,38 @@ CRISPASR_LANGUAGE = "auto"
 #
 # 取 off | whisper | silero | ecapa | firered | probe。
 #
-# 现在取 whisper,角色是【筛子】:判到的码不改 AED 的输出(AED 根本没有 per-request
+# 现在取 firered,角色是【筛子】:判到的码不改 AED 的输出(AED 根本没有 per-request
 # 语言开关,crispasr_backend_firered_asr.cpp:49-57 原话 "offers no per-request language
 # override, so `-l <lang>` cannot steer it"),只用来决定"这个文件该不该交给 qwen3 兜底"。
 # 判到 AED 范围外 → 那份 AED 文本不落盘、源文件留在原位,整批改用 qwen3 重跑
 # (实现见 _lid_map / transcribe_batch / process_batch)。
 #
-# 代价账(都不大):
-#   · 每个文件多跑一次 whisper-tiny。AED 的 962 MB 权重此时已经驻留,是额外分配;
-#     跑完 crispasr 会调 crispasr_lid_free_cache() 释放(crispasr_run.cpp:1021 注释,
-#     那是 #35 显存 OOM 的修补)—— 也就是说这个缓存在批内【每个文件都要重建一次】,
-#     不是我原先写的"每批一次"。耗时按 lidbench 实测:45 s 组 +1.8 s/文件,120 s 组
-#     不复现(逐文件差 −0.5 到 −1.7 s),落在抖动里(见上面第 (5) 条)。
-#   · 判据本身别当尺子用:只看前 15 秒【原始音频】(第 (6) 条:片头音乐会把语种定错)、
-#     whisper 路径没有置信度闸门(第 (7) 条:实测 p=0.395 也照样往下走)。
-#     lidbench 里 whisper-tiny 的召回是 中文 5/6、日语 2/4 —— 所以【假阴性一定会漏】:
-#     判成 zh 的日语文件仍会被 AED 用汉字编造一段话并正常落盘,这层没有任何兜底。
-#     要收这一层只能靠事后按内容特征筛,不在本脚本范围内。
+# 为什么从 whisper 换成 firered:按她的指令(10-14)。顺带对上的是它和主引擎同源
+# (都是小红书 FireRedTeam 的权重:FireRedASR2-AED / FireRedVAD / FireRedPunc / FireRedLID),
+# 词表里 20+ 汉语方言正是 AED 覆盖的那片;whisper-tiny 只认 99 种通用码,判不到方言。
+#
+# 代价账(两条是新账,量过的只有 whisper-tiny 那批):
+#   · 每个文件多跑一次筛子。AED 的 962 MB 权重此时已经驻留,是额外分配;跑完 crispasr
+#     会调 crispasr_lid_free_cache() 释放(crispasr_run.cpp:1021 注释,那是 #35 显存 OOM
+#     的修补)—— 也就是说这个缓存在批内【每个文件都要重建一次】,不是我原先写的"每批一次"。
+#     whisper-tiny 那版量到 45 s 组 +1.8 s/文件、120 s 组不复现(第 (5) 条)。
+#     ⚠ 换 firered 后每文件重装的东西从 77 MB 变成 543 MB(q4_k),驱动还设了
+#     CRISPASR_GGUF_MMAP=0(不走 mmap 就整份读进内存)—— 【这个开销没量过】,
+#     第一次跑生产批次时看日志里每文件的判别耗时就知道了。
+#     它还要显存:firered_lid_init 用的是 firered_asr_context_default_params()
+#     (src/firered_lid.cpp:50-54),那份默认参数里 use_gpu = true(src/firered_asr.cpp:297),
+#     所以筛子是按"编码器上 GPU"的方式加载的 —— 8 GB 卡上峰值多出 543 MB,发生在主模型
+#     分配【之前】,跑完立即由 crispasr_lid_free_cache() 释放(#35 就是为这个加的)。
+#   · 判据本身别当尺子用:窗口只有【前 5 秒】原始音频(第 (6) 条:15 秒截断 ∩
+#     firered_lid.cpp:78 的 5 秒截断)—— 片头音乐会把语种定错,这条比 whisper 更糟;
+#     p= 恒 1.0(第 (7) 条),结构上没有任何置信度闸门可用。
+#     本语料召回【未测】,所以【假阴性会漏】这条只能定性:判成 zh 的外语文件仍会被 AED
+#     用汉字编造一段话并正常落盘,这层没有任何兜底。要收这一层只能靠事后按内容特征筛,
+#     不在本脚本范围内。
+#   · 判别器【本身失败】时不回退到 whisper:crispasr_lid_cli.cpp 的 firered 分支只打
+#     "crispasr[lid]: firered LID failed" 就 return false(silero 那条分支才有
+#     whisper-tiny 兜底),随后 crispasr_run.cpp:1012 把语种强制成 en。所以筛子坏了
+#     【不会】报错,只会安静地把文件判成外语 —— 靠 LID_VERBOSE 把判别行捞出来数一数量。
 #   · 假阳性的代价是白跑一遍 qwen3(0.19 RTF,比 AED 快 5 倍),几乎不要钱。
 #
 # 什么时候改回 off:不想要兜底、只想让 AED 安静跑完时。off 的含义【不是】"关掉语种
@@ -547,12 +592,15 @@ CRISPASR_LANGUAGE = "auto"
 # :948 has_native_lid、:949 lid_disabled = (lid_backend 是 off|none)、:975 self-probe
 # (AED 与 qwen3 都没有)、:992 外部判别器、:1012 判别失败强制 en。
 # 填了非 off 的值就必须让 CRISPASR_LID_MODEL(在 CONFIG 顶部的资源块里)指到本地文件,
-# 留空或不存在的后果是每个文件联网下载 ggml-tiny.bin、超时约 30 s 后按
-# crispasr_run.cpp:1017 强制 en,所以 main_loop 启动时把"auto + 前置模型缺失"判为致命错误。
-CRISPASR_LID_BACKEND = "whisper"
+# 留空或不存在的后果是每个文件去联网下模型、超时后按 crispasr_run.cpp:1017 强制 en,
+# 所以 main_loop 启动时把"auto + 前置模型缺失"判为致命错误。
+#
+# 想换回 whisper-tiny 当筛子:CRISPASR_LID_BACKEND = "whisper" + CRISPASR_LID_MODEL 指向
+# GATE_WHISPER_MODEL 那份 ggml-tiny.bin(两件都在资源块里,pinned 清单也都有)。
+CRISPASR_LID_BACKEND = "firered"
 
 # LID_VERBOSE = True 时去掉 --no-prints,把 crispasr 的标准错误里那行
-# `crispasr: LID -> language = 'xx' (whisper, p=0.xxx)` 捞出来。那行受 !no_prints 控制
+# `crispasr: LID -> language = 'xx' (firered, p=1.000)` 捞出来。那行受 !no_prints 控制
 # (见上面第 (8) 条),所以【开着兜底就必须开着它】—— 关掉的后果不是"日志少几行",
 # 而是筛子一行判别都抓不到、_lid_map 返回空、所有文件都按"无结论"走 AED 落盘,兜底静默
 # 失效(main_loop 会为此打一条警告)。开着它同时把 USE_LID_FALLBACK=False,就变成
@@ -633,6 +681,11 @@ VAD_MAX_SPEECH_SEC = ""     # -vmsd:超过这个长度的语音段自动再切(�
 #                   零撞顶,1850 字(找回 3 个整句)。
 # 撞顶时 crispasr 不报错、日志只打 token 数、rc 仍为 0,所以 30 s 这一档是【静默丢内容】,
 # 不是慢的问题。速度代价实测接近零:s1 wall 44.0→43.9 s,s2 184.4→181.4 s。
+#
+# 【这条只在 crispasr 腿成立】150 顶是 crispasr 那份 AED 实现里写死的常数。切到
+# PRIMARY_LEG="onnx" 时主链换成 aed_ort.py 的每段预算 min(段时长 × 8 token/s, cache 上限),
+# 撞顶会把 truncated 标出来、不静默,那时 20 只剩"标点按段跑的粒度"这个作用。
+# 出厂默认腿 = crispasr ⇒ 20 是正确性前提,别因为 ONNX 那边不撞顶就调回 30。
 VAD_MAX_SEGMENT_SEC = 20
 
 # ---------- 波束搜索(-bs)----------
@@ -658,17 +711,21 @@ BATCH_POLL_SEC = 30
 
 # ==================== CONFIG · FireRed ONNX 主链 + 语种闸门 ====================
 #
-# ---------- 主力那一路换成 ONNX 全链路 ----------
+# ---------- 主力那一路由谁来实现 ----------
 #
 # PRIMARY_LEG 决定"小红书那一路"(ENGINE_PRIMARY = aed)由谁来实现:
+#   "crispasr" —— 【现在的出厂默认】:整批交给 crispasr.exe 的 firered-asr 后端,
+#                 换引擎的判据由 crispasr 批内的前置判别(现在是 FireRedLID)给出,
+#                 驱动从 stderr 对号(见 _lid_map)。
 #   "onnx"     —— 本包 onnx/ 下的 FireRedASR2S 全链路:FireRedVAD(ONNX) →
 #                 FireRedASR2-AED(纯 onnxruntime, aed_ort.py) → FireRedPunc(ONNX),
-#                 三个会话在本进程里常驻一次,逐文件跑。
-#   "crispasr" —— 10-09 之前的形态:整批交给 crispasr.exe 的 firered-asr 后端。
-#                 留着它有两个用处:权重/闸门任一缺席时还能有个跑得起来的样子;
-#                 同机对拍时要拿它当参照。
+#                 三个会话在本进程里常驻一次,逐文件跑。换回它:命令行前设
+#                 ASR_PRIMARY_LEG=onnx,或把下面这行的兜底值改成 "onnx"。
 #
-# 为什么值得换(全部是本仓实测,不是推测):
+# 10-14 按她的指令把默认翻回 crispasr。ONNX 那条腿【代码原样留着、随时可切】,
+# 它解决过的问题和它要的代价都记在下面,不要当成"已作废"。
+#
+# 切到 onnx 腿时你多得到(全部是本仓实测,不是推测):
 #   · crispasr 的 AED 后端把【解码器权重恒定放在 CPU】(src/firered_asr.cpp:441-444),
 #     本机 nvidia-smi dmon 连采 18 秒 sm/mem 全 0%、整卡 2-6 W —— 显卡整天空闲,
 #     而它吃 6-7 个 CPU 核。(10-09 用带时刻的 2 秒采样复验过这条:只走 AED 的单件跑
@@ -680,16 +737,22 @@ BATCH_POLL_SEC = 30
 #     批次上 ONNX 少 15%~38%。
 #   · 丢字形态不同:crispasr 每个切片解码上限硬顶 150 token(src/firered_asr.cpp:2075,
 #     无任何 CLI 参数可改),撞顶不报错、rc 仍为 0 = 【静默丢整句】;这条链的每段预算是
-#     min(段时长 × 8 token/s, cache 上限),撞顶会把 truncated 标出来。VAD 段上限设 20 s
-#     就是为绕开前者(见上面 VAD_MAX_SEGMENT_SEC 那段实测),换掉后端之后 20 这个数不再是
-#     正确性前提,但仍留着 —— 它同时是"标点按段跑"的粒度。
+#     min(段时长 × 8 token/s, cache 上限),撞顶会把 truncated 标出来、不静默。
+#     ⇒ VAD_MAX_SEGMENT_SEC = 20 在【现在的默认腿 crispasr 下是正确性前提】(30 s 的连续
+#     中文必撞 150 顶,见上面那段实测),翻到 onnx 腿后它才降级成"标点分段的粒度",
+#     那时 20 与 30 都不丢内容。别因为"ONNX 不撞顶"把它调回 30 又留着 crispasr 腿。
+# 切到 onnx 腿时你付出:多一套 python 依赖(onnxruntime,要 GPU 还得有 CUDA EP 那份解释器
+#   ⇒ 下面的 GPU_PY 自换机制【只在 PRIMARY_LEG="onnx" 时才会触发】,默认腿是 crispasr 时
+#   一行 ORT 都不碰),以及下面那段语种闸门(它【只在 onnx 腿跑】,判语种要用 crispasr 的
+#   `-dl` 早退,而那条早退只在 whisper 引擎里实现 —— 所以闸门用的判别模型是
+#   GATE_WHISPER_MODEL 那份 ggml-tiny.bin,不是批内筛子的 FireRedLID)。
 #
-# 换引擎的判据仍然【只有语种】,变的是"谁来判":以前判语种这件事发生在 crispasr 批内
-# (whisper 前置判别 + 从 stderr 对号),现在发生在调用主链之前,由下面的 GATE 独立完成。
-# 于是筛子那套 _lid_map 实时对号在主链为 onnx 时不再参与(它只服务 crispasr 批量调用),
-# 兜底那一趟照常走 crispasr 自己的 -l auto(不把判到的码传下去,理由见 CONFIG · CrispASR
-# 里"换引擎备查"那段)。
-PRIMARY_LEG = (os.environ.get("ASR_PRIMARY_LEG") or "onnx").strip().lower()
+# 换引擎的判据【只有语种】,两条腿只是"谁来判"不同:crispasr 腿在批内判(前置判别 +
+# 从 stderr 对号,即筛子那套 _lid_map);onnx 腿在调用主链之前由下面的 GATE 独立判,
+# 于是 _lid_map 在 onnx 腿不参与主链那一趟(它只服务 crispasr 批量调用),
+# 兜底那一趟在两腿下都照常走 crispasr 自己的 -l auto(不把判到的码传下去,理由见
+# CONFIG · CrispASR 里"换引擎备查"那段)。
+PRIMARY_LEG = (os.environ.get("ASR_PRIMARY_LEG") or "crispasr").strip().lower()
 
 # ---------- ONNX 链路的代码与权重 ----------
 # 全部相对本包目录,和 crispasr 那两件一样支持环境变量覆盖;models 子树不进库,
@@ -753,14 +816,20 @@ ONNX_ASR_THREADS  = int(os.environ.get("FIREDASR_ONNX_THREADS") or
 ONNX_VAD_THREADS  = min(8, os.cpu_count() or 8)
 ONNX_PUNC_THREADS = 4
 
-# ---------- 语种闸门 ----------
+# ---------- 语种闸门(【只在 PRIMARY_LEG = "onnx" 时运行】)----------
+#
+# 默认腿翻回 crispasr 之后这一整段是【休眠代码】:批内筛子(CRISPASR_LID_BACKEND)
+# 已经在 crispasr 进程里判过语种了,闸门存在的理由是"主链不再是 crispasr 时,得有人
+# 在调用它之前独立判一次"。所以下面所有关于判别器的数字都还是 whisper-tiny 的 ——
+# 闸门必须用 whisper-tiny(GATE_WHISPER_MODEL),不能用 FireRedLID:`-dl` 那条"判别完
+# 就退出"的早退只在 whisper 引擎里实现(src/crispasr.cpp:7953-7970)。
 #
 # 两步,都是 crispasr 的短调用,固定 --gpu-backend cpu(独显留给主链,而且这两次调用
 # 各只要一两秒,让 crispasr 去建 CUDA 上下文纯属浪费一份显存):
 #   1) `--vad -vm <silero> --vad-export-raw <json> --strict-pipeline --require-vad`
 #      拿真语音段。必须用 --vad-export-raw:不带 -raw 的那份导的是 kind="chunks"
 #      (30 s 网格),不是语音段(10-09 校机实测)。
-#   2) 按语音段拼出【前 15 秒语音】写成临时 wav,再 `-m <ggml-tiny.bin> -dl` 判语种。
+#   2) 按语音段拼出【前 15 秒语音】写成临时 wav,再 `-m <GATE_WHISPER_MODEL> -dl` 判语种。
 #      这一步的价值是把判别器看到的音频从"原始前段"换成"真语音"。
 #      【窗口长度这里先前注释写错了,公开更正】原话是"whisper 那条判别路径本来就只截
 #      原始音频前 15 s",可那个 kLidMaxSamples = 16000*15(src/crispasr_lid.cpp:284)属于
@@ -1185,6 +1254,8 @@ _STAGE_SEQ = itertools.count()
 _NO_SPEECH_RE = re.compile(r"no speech detected in '([^']*)'")
 
 # CLI 的语种判别行:crispasr_run.cpp:1003 `crispasr: LID -> language = 'xx' (whisper, p=0.395)`
+# 换 firered 筛子后同一行变成 `(firered, p=1.000)`,而且引号里可能是【两个词】
+# ("zh mandarin")—— 正则用 [^']+ 整段捕获,不拆空格,拆在 _in_aed_range 里做。
 _LID_RE = re.compile(r"LID -> language = '([^']+)' \(([^)]*)\)")
 
 # 走到了判别这一步、但没出码的行 —— 它同样【占一个槽位】,不记下来就会让它后面的文件
@@ -1198,14 +1269,29 @@ _UNREADABLE_RE = re.compile(r"crispasr: error: failed to read audio '([^']*)'")
 
 # AED 能覆盖的语种码前缀。超出这个范围 AED 不会"换个语种转",只会拿汉字编造
 # (crispasr_backend_firered_asr.cpp:49-70 + issue #199)—— 这就是兜底引擎存在的理由。
-# 汉语方言码按 whisper-tiny 实际会吐的 ISO 639-1/4 取值列(它认 yue,方言多半归到 zh,
-# 所以这份名单宁可宽一点:多算"范围内"= 少一次 qwen3 重跑,代价小)。
+# 名单里的 ISO 码(hak/nan/wuu/hsn/gan/jin/mnp/cxh/cta/cdo/hne/waw/mwv)是按 639-3
+# 放宽的:多算"范围内"= 少一次 qwen3 重跑,代价小。
 _AED_IN_RANGE = ("zh", "en", "yue", "cmn", "hak", "nan", "wuu", "hsn", "gan", "jin",
                  "mnp", "cxh", "cta", "cdo", "hne", "waw", "mwv")
+# FireRedLID 的词表(model/dict.txt,120 个标签,逐字读过)把汉语方言做成【独立 token】:
+# mandarin / xinan / min / wu / xiang / north,外加已经在上面名单里的 yue。判别输出因此
+# 经常是【两个词】("zh mandarin"),所以旧那行 `code.split("-")[0]` 不够 —— 它按连字符拆,
+# 拆不开空格,会把整串 "zh mandarin" 当成一个码而判成范围外(等于每个中文文件都白跑一遍
+# qwen3)。现在按空白/连字符一起拆,取【头一个 token】判。
+# 为什么取头一个而不是"任一命中":取任一会让 "zh ja" 这类混标算作范围内,而范围内 = 交给
+# AED 编造(假阴性,不可恢复);范围外 = 交给 qwen3 重跑(假阳性,几乎不要钱)。所以判据
+# 严格偏向"取头一个"。另注:min 在 639-1 里是马恩岛语、在 FireRed 词表里是闽语 —— 本语料
+# 不会同时出现两种,按闽语算。词表里那个 "other" 是【真实类别】(不属于 100+ 已知语种),
+# 它不在任何名单里 ⇒ 判到 other 就走兜底,这正是想要的行为。
+_FIRERED_DIALECT = ("mandarin", "xinan", "min", "wu", "xiang", "north")
 
 
 def _in_aed_range(code: str) -> bool:
-    return (code or "").lower().split("-")[0] in _AED_IN_RANGE
+    toks = [t for t in re.split(r"[\s\-_]+", (code or "").strip().lower()) if t]
+    if not toks:
+        return False
+    head = toks[0]
+    return head in _AED_IN_RANGE or head in _FIRERED_DIALECT
 
 
 def _can_read_lid() -> bool:
@@ -1616,15 +1702,18 @@ def _gate_crispasr(extra):
     固定 `--gpu-backend cpu`:独显要留给 ONNX 主链,而且这两步各只要半秒到一秒
     (10-09 校机纯 CPU 实测:VAD 导段 0.46 s、-dl 1.07 s),为它们建一次 CUDA 上下文
     纯属浪费,还会多一份 ggml-cuda 常驻显存。
-    `-m` 用 whisper-tiny(77 MB):`--vad-export-raw` 和 `-dl` 都只要一个能加载的后端,
-    tiny 是手里最小的那一个,而且判别器本来就是它。
+    `-m` 用 GATE_WHISPER_MODEL(whisper-tiny,77 MB),【不是】批内筛子那份 CRISPASR_LID_MODEL:
+    `--vad-export-raw` 和 `-dl` 都只要一个能加载的后端,tiny 是手里最小的那一个;更关键的是
+    `-dl` 那条"判完就退出"的早退与 `auto-detected language:` 那行都是 whisper 引擎特有的
+    (src/crispasr.cpp:7953-7970),换成交给批内筛子的 FireRedLID 根本不产生这一行,
+    _GATE_LANG_RE 就抓不到东西 ⇒ 闸门全批没结论。
 
     这里【不传】--no-prints:判别行是 crispasr 的 print,受 !no_prints 控制,加了它
     闸门就一行结论都抓不到(同一个坑在 LID_VERBOSE 那段写过)。
     也不传 --strict-pipeline 之外的任何东西到第 2 步:-dl 与 --vad-export-raw 同时给时,
     实测 0.46 s 就退出且不打印语种 = 静默假成功(10-09 校机 E 档),所以两步必须分开跑。
     """
-    cmd = [CRISPASR_EXE, "-m", CRISPASR_LID_MODEL, "-t", str(GATE_THREADS),
+    cmd = [CRISPASR_EXE, "-m", GATE_WHISPER_MODEL, "-t", str(GATE_THREADS),
            "--gpu-backend", "cpu"] + [str(x) for x in extra]
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
@@ -1936,9 +2025,11 @@ def onnx_leg_setup() -> int:
         logger.critical(f"闸门 VAD 模型不存在:{GATE_VAD_MODEL}\n"
                         f"  闸门没有语音段就只能拿原始件去判(那条读前 30 s),静音开头的外语文件会判错")
         return 2
-    if not os.path.isfile(CRISPASR_LID_MODEL):
-        logger.critical(f"闸门判别模型不存在:{CRISPASR_LID_MODEL}\n"
-                        f"  -dl 判不出语种 = 所有文件都按主链跑,AED 会对范围外语种编造汉字")
+    if not os.path.isfile(GATE_WHISPER_MODEL):
+        logger.critical(f"闸门判别模型不存在:{GATE_WHISPER_MODEL}\n"
+                        f"  -dl 判不出语种 = 所有文件都按主链跑,AED 会对范围外语种编造汉字\n"
+                        f"  注意闸门只认 whisper-tiny:`-dl` 那条早退是 whisper 引擎特有的\n"
+                        f"  (src/crispasr.cpp:7953-7970),拿批内筛子那份 FireRedLID 权重来跑闸门判不出")
         return 2
     for d in (ONNX_MODELS_DIR, ONNX_VAD_DIR, ONNX_PUNC_DIR):
         if d and not os.path.isdir(d):
@@ -1957,7 +2048,7 @@ def onnx_leg_setup() -> int:
     logger.info(f"主链:FireRedASR2S ONNX 全链路(VAD+AED+Punc 常驻),"
                 f"provider={ONNX_PROVIDER} 图={ONNX_GRAPH} 模式={ONNX_MODE}")
     logger.info(f"语种闸门:crispasr silero VAD 导段 + whisper-tiny -dl"
-                f"({os.path.basename(GATE_VAD_MODEL)} + {os.path.basename(CRISPASR_LID_MODEL)})")
+                f"({os.path.basename(GATE_VAD_MODEL)} + {os.path.basename(GATE_WHISPER_MODEL)})")
     return 0
 
 
@@ -2358,10 +2449,10 @@ def main_loop() -> int:
 # 写死了 python.exe 的绝对路径、PowerShell 调用和反斜杠,换机器或迁 Linux 都得重
 # 写一遍;收进本文件后启动方式和配置在同一处,Windows / POSIX 各走各的进程分离参数。
 #
-#   python Wlid-Og-fired-Cg-qwen.py                前台跑(关窗口即断,但 Job Object 会连带杀掉
+#   python Flid-Cg-firered-Cg-qwen.py                前台跑(关窗口即断,但 Job Object 会连带杀掉
 #                                      crispasr.exe,不会留孤儿占显存)
-#   python Wlid-Og-fired-Cg-qwen.py --start    后台跑,控制台输出重定向到 txt\log\console_*.log
-#   python Wlid-Og-fired-Cg-qwen.py --stop     建 STOP 标志,实例在下一批边界优雅退出
+#   python Flid-Cg-firered-Cg-qwen.py --start    后台跑,控制台输出重定向到 txt\log\console_*.log
+#   python Flid-Cg-firered-Cg-qwen.py --stop     建 STOP 标志,实例在下一批边界优雅退出
 #
 # --start 先抢一次锁再放掉,只为把"已经有实例在跑"报在当场,而不是让后台子进程
 # 静默起一个然后自己退掉。真正防并发仍靠子进程里的那次 acquire_lock。
@@ -2485,7 +2576,7 @@ def switch_interpreter_if_needed(arg):
 if __name__ == "__main__":
     _arg = (sys.argv[1] if len(sys.argv) > 1 else "").lower()
     switch_interpreter_if_needed(_arg)
-    _USAGE = ("用法: python Wlid-Og-fired-Cg-qwen.py [--start | --stop]\n"
+    _USAGE = ("用法: python Flid-Cg-firered-Cg-qwen.py [--start | --stop]\n"
               "  (无参数)  前台转写整个队列\n"
               "  --start   后台转写(控制台输出 -> txt\\log\\console_*.log)\n"
               "  --stop    让在跑的实例在下一批边界退出\n")
