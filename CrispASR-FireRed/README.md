@@ -10,8 +10,8 @@ crispasr 的 qwen3（N 卡）；主力一直是 FireRed 那套。
 
 | `PRIMARY_LEG` | 主力那一路（"小红书 ASR"部分）由谁跑 | 语种怎么定 |
 |---|---|---|
-| `"crispasr"`（**出厂默认**） | CrispASR 的 `firered-asr` backend（AED 的 gguf q4_k 量化件，解码器恒在 CPU、编码器可上 CUDA） | **批内筛子**：一趟 `--lid-backend firered --lid-model firered-lid-q4_k.gguf`，从 stderr 逐文件读 `crispasr: LID -> language = 'xx' (firered, p=1.000)` |
-| `"onnx"`（`ASR_PRIMARY_LEG=onnx`） | 本包 `onnx/` 里的 **FireRedASR2S ONNX 全链路**：FireRedVAD → FireRedASR2-AED（纯 onnxruntime）→ FireRedPunc，三个会话在驱动进程里常驻一次 | **闸门**（独立两步，不用批内筛子）：crispasr 的默认 silero VAD 导语音段 → 拼前 15 s 语音 → `whisper-tiny -dl` 判语种 |
+| `"crispasr"`（**出厂默认**） | CrispASR 的 `firered-asr` backend（AED 的 gguf q4_k 量化件，解码器恒在 CPU、编码器可上 CUDA） | **帧级路由**（10-16 起，`LID_ROUTER="frame"`）：驱动进程里常驻一份 FireRedLID ONNX，FireRedVAD 导段 → 整文件滑窗判语种 → 范围外满 3 段的文件**根本不喂 AED**。见第 7 节。设 `ASR_LID_ROUTER=sieve` 就退回 10-14 那版：**批内筛子**，一趟 `--lid-backend firered --lid-model firered-lid-q4_k.gguf`，从 stderr 逐文件读 `crispasr: LID -> language = 'xx' (firered, p=1.000)`，只看每条音频的头 5 秒 |
+| `"onnx"`（`ASR_PRIMARY_LEG=onnx`） | 本包 `onnx/` 里的 **FireRedASR2S ONNX 全链路**：FireRedVAD → FireRedASR2-AED（纯 onnxruntime）→ FireRedPunc，三个会话在驱动进程里常驻一次 | **闸门**（独立两步，不用批内筛子）：crispasr 的默认 silero VAD 导语音段 → 拼前 15 s 语音 → `whisper-tiny -dl` 判语种。第 7 节那条帧级路由**不作用在这条腿上**（`ort` 原样不动） |
 
 两档共用同一份兜底：判到 AED 语种范围外 → 这批文件立刻用 `qwen3` 重跑（同一批内完成）。
 换档不改任何其它参数，onnx 那一条腿的代码一行没删。
@@ -21,6 +21,12 @@ crispasr 的 qwen3（N 卡）；主力一直是 FireRed 那套。
 ONNX 图）。四件事各有各的文件，所以这一份是三个 CrispASR 方案里组件最多的一套
 （crispasr 侧自动下载合计 **5,181,700,009 B**，10-14 加了筛子那件 569,688,704 B；
 `"onnx"` 档还要再加 `onnx/` 那三件权重，见第 1 节）。
+10-16 加的帧级路由（第 7 节）还要 `onnx/models/FireRedLID-onnx` 那两张图（`lid_encoder.onnx`
+2,451,530 + `lid_encoder.onnx.data` 2,893,425,664 + `lid_decoder_step.onnx` 549,729 +
+`lid_decoder_step.onnx.data` 655,949,824 = **3,552,376,747 B**，逐件字节与 sha256 在 `cpu` 分支
+那份 README 的导出表里，10-06 在校机上算的）外加同目录那对 `dict.txt` / `cmvn.ark`。这些都是
+**建造产物**，`fetch_assets.py` 下不到它们；再要一个能跑的 ffmpeg。缺任何一样都在起批前当场
+写在日志里并把路由降级成筛子，不会悄悄少判一片文件。
 
 ---
 
@@ -63,8 +69,8 @@ crispasr 侧全部是"下载即终件"，ONNX 侧有两件（`punc.f32.onnx`、`
 核对现状不联网用 `--check`，看全部 URL 与哈希用 `--list`，只补某一件用 `--only NAME`。
 
 上面那两个 env 就是驱动 CONFIG 里 `CRISPASR_BIN_DIR` / `MODEL_DIR` 读的两个；数据面另有
-`ASR_TEXT_DIR` / `ASR_AUDIO_DIR`；`"onnx"` 档另有下表四个。都不设时全部落在包目录下，
-所以**复原完不改一行就能跑**：
+`ASR_TEXT_DIR` / `ASR_AUDIO_DIR`；`"onnx"` 档另有下表四个；帧级路由（第 7 节）另有两行。
+都不设时全部落在包目录下，所以**复原完不改一行就能跑**：
 
 | env | 默认（相对包目录） | 是什么 |
 |---|---|---|
@@ -77,6 +83,8 @@ crispasr 侧全部是"下载即终件"，ONNX 侧有两件（`punc.f32.onnx`、`
 | `FIREDASR_ONNX_PROVIDER` | `cuda` | ONNX 的执行提供者：`cpu` / `cuda`。**只有这两个值**，见第 6 节那条"只用 N 卡"。没有 CUDA EP 的机器要显式给 `cpu`，否则起批前当场停 |
 | `FIREDASR_GPU_PY` | 空 = 不换 | 装了 CUDA EP 的那个解释器的绝对路径。非空时驱动在起批前先看**当前解释器**有没有 `CUDAExecutionProvider`，没有就用它把自己原地重启一次（只一次，靠 `FIREDASR_GPU_PY_SWITCHED` 记账防循环）。出厂留空：仓库里不写机器专属路径，见 §6.3 |
 | `FIREDASR_ONNX_GRAPH` | `mixed` | AED 图形状，必须与建权重时 `--graph` 给的那个一致 |
+| `ASR_LID_ROUTER` | `frame` | 默认腿（`crispasr`）怎么挑语种：**`frame` = 整文件帧级路由（第 7 节）** / `sieve` = 10-14 那版批内筛子（只看头 5 秒）/ `off` = 不挑，AED 一条道跑到黑 |
+| `ASR_FFMPEG` | 空 = 用 PATH 里的 `ffmpeg` | 帧级路由解 `m4a` / `mp4` / `aac` 用的可执行文件。libsndfile 不认这三种容器，而小红书下载下来的恰好主要是这一类；没有能跑的 ffmpeg，第 7 节那条路在起批前整体降级成 `sieve` |
 
 七份 crispasr 侧权重的文件名分别写在 `CRISPASR_MODEL_AED` / `CRISPASR_MODEL_QWEN3` /
 `CRISPASR_PUNC_MODEL` / `CRISPASR_LID_MODEL`（批内筛子 = firered-lid-q4_k）/
@@ -110,7 +118,10 @@ I/O 契约（与 `CrispASR-Qwen/`、`cpu` 分支那两份逐条相同）：
 - 输出 `ASR_ROOT\<组名>.txt`，**追加**写：`title:<相对 p 的路径>` + 正文 + 空行。
 - 成功 send2trash；空转写即删且不落记录；失败按相对路径隔离进 `f\`（保目录结构）。
 - `BATCH_SIZE = 28`；批内每 30 秒轮询已写出的 `.txt`，落盘一个清一个。
-- 语种筛子判到 AED 范围外的文件**不落盘**，攒下来立刻用 qwen3 兜底重跑（同一批内完成）。
+- 默认腿先跑**帧级路由**再跑 AED（第 7 节）：判到 AED 范围外满 3 个子段的文件**根本不喂 AED**，
+  直接攒下来用 qwen3 兜底；放行的那趟 crispasr 不挂前置判别器（`--lid-backend off`）。
+  用 `ASR_LID_ROUTER=sieve` 退回旧形态：语种筛子判到范围外的文件照样喂 AED、但输出**不落盘**，
+  攒下来立刻用 qwen3 兜底重跑（同一批内完成）。
 - VAD 判"整段无语音"的文件 rc 仍是 0、不落 `.txt`，转写树上什么都不留，
   所以在这里记账：`ASR_ROOT\no_speech.txt`（`NO_SPEECH_LOG`），格式是 `时间 \t 原因 \t 相对路径`。
 - `.lock` 单实例锁，**与同一 `ASR_ROOT` 下的其它 crispasr 驱动互斥**（同一份数据面
@@ -130,11 +141,11 @@ I/O 契约（与 `CrispASR-Qwen/`、`cpu` 分支那两份逐条相同）：
 | `cublas64_12.dll` / `cublasLt64_12.dll` / `cudart64_12.dll` | 同一个 release 页的独立资源（113,712,640 / 692,441,600 / 573,952 B） | **A** | 哈希取自 release 附带的 `crispasr-windows-x86_64-cuda-runtime-sha256.txt`（251 B / `92e42561…`） |
 | `msvcp140/vcomp140/vcruntime140/vcruntime140_1.dll` | 微软 `vc_redist.x64.exe`（aka.ms 链接） | **C** | 装了 redist 就不用管；不能装就拷这 4 份到 exe 同目录。`--check` 只给 WARN |
 | `firered-asr2-aed-q4_k.gguf` 962,807,328 B | `huggingface.co/cstr/firered-asr2-aed-GGUF` | **A** | sha256 = HF 的 LFS oid；也就是 CrispASR `-m auto` 注册表 `firered-asr` 那一行。上游 FireRedASR2 是 Apache-2.0 |
-| `fireredpunc-q8_0.gguf` 108,664,800 B | `huggingface.co/cstr/fireredpunc-GGUF` | **A** | 书面标点后处理，**只给 AED 用**。必须给本地路径：留空时 crispasr 取 `auto` 并联网下 FireRedPunc（`crispasr_run.cpp:3940`），拉不动的机器每批白等一次超时。上游 BSD-2-Clause |
+| `fireredpunc-q8_0.gguf` 108,664,800 B | `huggingface.co/cstr/fireredpunc-GGUF` | **A** | 书面标点后处理，**只给 AED 用**。必须给本地路径：留空时 crispasr 取 `auto` 并联网下 FireRedPunc（`examples/cli/crispasr_run.cpp:3940`），拉不动的机器每批白等一次超时。上游 BSD-2-Clause |
 | `firered-vad.gguf` 2,357,952 B | `huggingface.co/cstr/firered-vad-GGUF` | **A** | **转写侧**的 VAD（`_base_cmd` 里 `-vm` 那一行，qwen3 兜底与容器退回都走它）。**转写不用 crispasr 默认的 silero v6.2.0**，理由见第 5 节；silero v6 在 `"onnx"` 档里只出现在闸门（见下面那行）。上游 BSD-2-Clause |
 | `firered-lid-q4_k.gguf` 569,688,704 B | `huggingface.co/cstr/firered-lid-GGUF` | **A**（发布方侧） | **10-14 起的批内语种筛子**（`--lid-backend firered --lid-model` 这件），`PRIMARY_LEG="crispasr"`（出厂默认）那一路每文件判一次。sha256 = HF 的 LFS oid（10-14 直读 `api/models/cstr/firered-lid-GGUF/tree/main` 拿的）；同仓另有 f16/q8_0/q2_k 三档，换档只改 path/bytes/sha256 三行（五档哈希都记在 `assets.json` 那条 note 里）。**这一件生产机没有**，所以 A 口径里"与生产机那份逐字节相同"那一半是【无从对照】，能核的是"照链接下载 → `fetch_assets.py` 按这个 oid 验收"。选 q4_k 的依据：CrispASR 主 README:611 把这档记作"Q4_K (544 MB), 120 languages including Chinese dialects. Slower but covers more languages"，而 `--lid-backend firered` 不给 `--lid-model` 时自动下的默认件是 f16（1.7 GB）—— 8 GB 显存的机器按最便宜够用取 q4_k。**四条代价**（窗口只有头 5 秒、置信度恒 1.0、失败不退回 whisper、每文件重装且 `use_gpu=true`）见第 5.2 节，本语料召回**未测** |
 | `ggml-tiny.bin` 77,691,713 B | `huggingface.co/ggerganov/whisper.cpp` | **A** | 现在**只服务 `onnx` 档的语种闸门**（`-dl` 那一步，`GATE_WHISPER_MODEL`）。默认腿 crispasr 下它不参与拼命令、`onnx_leg_setup` 之外不检查它。切到 onnx 腿前必须把它下齐（要本地文件，否则 crispasr 联网下、离线机器卡满超时）。为什么闸门不能改用上面那件 firered-lid：`-dl` 的"判完就退出"和 `auto-detected language:` 那行都是 whisper 引擎特有的（`src/crispasr.cpp:7953-7970`） |
-| `ggml-silero-v6.2.0.bin` 885,098 B | `huggingface.co/ggml-org/whisper-vad` | **A** | **闸门**第 1 步的 VAD，也就是 crispasr `--vad` 的默认那个（`crispasr_vad_cli.cpp:19` 的 URL 就是这条）。只用于"判语种前导个段"，不参与转写。sha256 两头对上：HF 的 LFS oid 与纯 CPU 测试机上实跑那份相同（10-09 `sha256sum` 直读） |
+| `ggml-silero-v6.2.0.bin` 885,098 B | `huggingface.co/ggml-org/whisper-vad` | **A** | **闸门**第 1 步的 VAD，也就是 crispasr `--vad` 的默认那个（`examples/cli/crispasr_vad_cli.cpp:19` 的 URL 就是这条）。只用于"判语种前导个段"，不参与转写。sha256 两头对上：HF 的 LFS oid 与纯 CPU 测试机上实跑那份相同（10-09 `sha256sum` 直读） |
 | `qwen3-asr-1.7b-q8_0.gguf` 2,506,723,200 B | `huggingface.co/cstr/qwen3-asr-1.7b-GGUF` | **A** | 兜底引擎权重。显存不够换同仓 q4_k（1,490,915,200 B / `ec197cef…`），换时 path 与 sha256 一起改 |
 | `onnx/models/**`（AED 图 / FireRedVAD / FireRedPunc，约 5.5 GB） | `onnx/fetch_assets.py` 自己那份清单：sherpa-onnx 的 GitHub release + 两个 HuggingFace 仓，另有两件本地 `dequant_*` 建造 | **A**（下载件）/**A**（建造件按 sha256 逐字节复现） | `"onnx"` 档才需要。与 crispasr 侧那份清单**没有重叠**，所以不存在两处对齐问题；`--list` 打全表、`--check` 不联网核对现状 |
 
@@ -179,6 +190,11 @@ I/O 契约（与 `CrispASR-Qwen/`、`cpu` 分支那两份逐条相同）：
 | `CRISPASR_LANGUAGE` | `"auto"` | AED 内置语种判别只覆盖 中文(+约20种汉语方言)/英语/粤语，范围外**不是差一点，是拿汉字编造**，而且 `-l` 改不了它 |
 | `CRISPASR_LID_BACKEND` | `"firered"` | 前置筛子（10-14 从 `"whisper"` 换过来，配合 `CRISPASR_LID_MODEL` 那件 firered-lid-q4_k）。**只在默认腿 `crispasr` 下拼进转写命令**，每文件判一次；`onnx` 档不用它，那条腿的语种由下面 `GATE_*` 那三步独立判。四条性质与换回 whisper 的方法见第 5.2 节 |
 | `BATCH_SIZE` | `28` | 一次调用喂多个 `-f`，模型/VAD 只加载一次 |
+| `LID_ROUTER` | `"frame"` | 10-16 加的那层：换不换引擎由**整文件**的帧级判别决定，不是由前几秒决定。`frame` = 每条音频完整过一遍 FireRedLID ONNX（`onnx/optional-lid/lid_onnx.py`，CPU），按 VAD 段计票；`sieve` = 10-14 那种批内前置筛子（每文件只看前 5 s）；`off` = 两层都不挂，整批直接喂 AED。之所以非 `frame` 不可：`src/crispasr_lid.cpp:284` 把外部判别器的输入截到原始音频前 15 s，`src/firered_lid.cpp:78` 在里面**再截到 5 s**，而 crispasr 的 CLI **没有任何窗口旋钮**（只有 `--lid-backend` / `--lid-model` / `--lid-on-transcript`，`examples/cli/cli.cpp:496-500`）—— 也就是说"整个文件都在 FireRed 支持/不支持之列"这句话，crispasr 自己给不出来。判据与四条降级见 §7 |
+| `FRAME_LID_MIN_BAD_SEGS` / `FRAME_LID_UNIT_SEC` / `FRAME_LID_MIN_UNIT_SEC` | 3 / 6.0 / 1.0 | 她定的"占比要到起码三段才切换 Qwen，以防误判"。**计数单位是子段不是 VAD 段**：一条日语独白在 VAD 下常常只有一两段（10-09 校机实测 80.2 s 素材的段表只有一条 0.03–79.55 s），不切子段的话"≥3 段"永远达不成；按 6 s 切成互不重叠的子段后，换引擎要三段独立证据 ≈ 18 s 范围外。短于 1 s 的尾巴凑不满一个 3 s 窗、只白占计数，丢掉。为什么门限是"段"而不是置信度：`src/firered_lid.cpp:90` 把 confidence **写死 1.0**，结构上没有置信度闸门可用 |
+| `FRAME_LID_WIN_SEC` / `FRAME_LID_HOP_SEC` / `FRAME_LID_MODE` | 3.0 / 1.5 / `"slice"` | 滑窗逐窗解码，与 `onnx` 腿那条 `run_lid` 同一套参数、同一份代码（驱动直接调 `chain.run_lid`，不复制实现）。`slice` 是"一次编码、逐窗解码" |
+| `FRAME_LID_SLICE_SEC` | 60.0 | 一次编码最多覆盖多少秒。编码器是 Conformer 全自注意力，分数矩阵随时长**平方**涨：十分钟素材 T=15000 帧（25 帧/s），单层 4 头就要 4×15000²×4 B ≈ 3.6 GB，夜间无人值守会被它撑死。把相邻子段打包成 ≤60 s 的块、每块各自编码，总代价 ∝ ΣTᵢ² 比整条**更省**；代价只有块边界上的窗少看几十秒上下文，而 3 s 窗判语种用不着长上下文。`0` = 不切，整条一次编码 |
+| `FFMPEG_EXE` | PATH 里找到的 `ffmpeg`，找不到为空 | 路由要拿到 **PCM**，而 libsndfile 只认 wav/flac/ogg/oga/opus/mp3；`EXTENSIONS` 里的小红书主流封装 m4a / mp4 / aac 恰好全在外面。crispasr 内部那套 ffmpeg 是**静态链进二进制的库**，python 侧够不着，只能另找可执行文件。只在 libsndfile 失手时接管。**启动前探测（`_ffmpeg_probe()`）不通过 ⇒ 整条路由降级成 `sieve`**，因为"这台机器有没有能跑的 ffmpeg"是环境属性不是文件属性，而留着等于给这三类容器开了一个连筛子都没有的洞。要指定就 `ASR_FFMPEG=<路径>` |
 | `PRIMARY_LEG` | `"crispasr"` | 主力那一路由谁跑（第 6 节）。10-14 按她的指令从 `"onnx"` 翻回来；要切 ONNX 腿设 `ASR_PRIMARY_LEG=onnx`，那条腿的代码与权重原样留着 |
 | `ONNX_PROVIDER` | `"cuda"` | ONNX 的执行提供者，**只认 `cpu` / `cuda`**。写别的（DirectML、OpenVINO）驱动直接退出 —— 那两个能挑中 AMD 核显。出厂值 10-09 从 `cpu` 改成 `cuda`（同一批三件实测 cuda RTF 0.427 对纯 CPU 0.566，§6.6）。**没有 CUDA EP 的机器现在会当场停在起批前那道 `enc_ep` 断言**，要在那种机器上跑得显式给 `FIREDASR_ONNX_PROVIDER=cpu` |
 | `GPU_PY` | `""`（不换） | 会话在本进程常驻（不外包子进程），所以"编码器在不在卡上"取决于**现在跑这份脚本的那个 python 里的 onnxruntime**。一台机器上常见"装 CUDA EP 的 ORT 在某个 venv 里，而双击 / 计划任务用的是另一个解释器"，这一步就是给那种情形留的：起批前换一次解释器，换完仍不起 CUDA 照旧停在 `enc_ep` 断言上。判据是纯函数 `should_switch_interpreter()`（只在无参数、`--start`、`--bg`、`/start` 这四条路上问 EP，`--stop` / `--help` / `crispasr` 主腿 / `provider=cpu` 一行 ORT 都不 import），逐条见 §6.3 |
@@ -186,12 +202,19 @@ I/O 契约（与 `CrispASR-Qwen/`、`cpu` 分支那两份逐条相同）：
 | `ONNX_DEC_ON_GPU` | `False` | 编码器上卡、解码器留 CPU。10-09 在 N 卡上实测：解码器也上卡**更慢**（整批 418.9 s → 537.2 s，+28%），显存倒是放得下（峰值 4,788 MiB / 8,188 MiB）。机制与 crispasr 那边同源结论见 §5.1，数值见 §6.6 |
 | `ONNX_ASR_THREADS` / `ONNX_VAD_THREADS` / `ONNX_PUNC_THREADS` | 逻辑核一半 / ≤8 / 4 | 与 `cpu` 分支那个分发包同口径（10-06 实测并回去的） |
 | `GATE_VAD_MODEL` | `model/ggml-silero-v6.2.0.bin` | 闸门第 1 步 = crispasr `--vad` 的**默认**那个模型（本地路径，不让它联网下） |
-| `GATE_LID_SEC` / `GATE_MIN_SPEECH_SEC` | 15.0 / 1.0 | 判别用 15 s 语音。**这个 15 不是上游的限制**：闸门读的那行（whisper 自己的检测）实测吃**前 30 s**，而 crispasr 的**外部判别器**截 15 s（`crispasr_lid.cpp:284`，`kLidMaxSamples = 16000*15`）—— 那是批内筛子走的那条路，10-14 之后批内筛子换成了 FireRedLID，它在外层 15 s 之内**再截到 5 s**（`firered_lid.cpp:78`），见 §5.2。先前本节和驱动注释都写成"whisper 那条路径本来就只截 15 s"，**那是错的，在此公开更正**；窗口实测与后果见 §6.6 末条。**10-10 她已定：保持 15，不提到 30**（§6.7） |
+| `GATE_LID_SEC` / `GATE_MIN_SPEECH_SEC` | 15.0 / 1.0 | 判别用 15 s 语音。**这个 15 不是上游的限制**：闸门读的那行（whisper 自己的检测）实测吃**前 30 s**，而 crispasr 的**外部判别器**截 15 s（`src/crispasr_lid.cpp:284`，`kLidMaxSamples = 16000*15`）—— 那是批内筛子走的那条路，10-14 之后批内筛子换成了 FireRedLID，它在外层 15 s 之内**再截到 5 s**（`src/firered_lid.cpp:78`），见 §5.2。先前本节和驱动注释都写成"whisper 那条路径本来就只截 15 s"，**那是错的，在此公开更正**；窗口实测与后果见 §6.6 末条。**10-10 她已定：保持 15，不提到 30**（§6.7） |
 | `GATE_THREADS` / `GATE_TIMEOUT_SEC` | 2 / 300 | 闸门两步各是一次短调用，固定 `--gpu-backend cpu`（独显留给主链） |
 
 **上面 `ONNX_*` / `GPU_PY` / `GATE_*` 那几行只在 `PRIMARY_LEG="onnx"` 时被读到**（10-14 起
-出厂默认是 crispasr）。驱动里那两段的标题也标了这一点；`--check`、`should_switch_interpreter()`
-和 `onnx_leg_setup()` 都按腿分支，默认腿下一行 ORT 都不 import、一次 crispasr 短调用都不发。
+出厂默认是 crispasr）。驱动里那两段的标题也标了这一点；`should_switch_interpreter()`
+和 `onnx_leg_setup()` 都按腿分支，默认腿下一次 crispasr 短调用都不发。
+`LID_ROUTER` / `FRAME_LID_*` / `FFMPEG_EXE` 那几行正相反 —— 只在 `crispasr` 腿生效，
+`onnx` 腿的语种闸门原样不动。**10-16 更正**：这一节原先写"默认腿下一行 ORT 都不 import"，
+帧级路由上线之后**这句不成立了** —— `frame` 那趟要在 crispasr 之外建 FireRedLID 的 ORT 会话，
+所以默认腿现在确实会 import onnxruntime；但它落在 **CPU**（`lid_onnx.py` 建会话时 providers
+写死 `CPUExecutionProvider`，驱动没改那个文件），因此**不涉及** `GPU_PY` 换解释器那套，
+系统 python 里只有 CPU EP 的那份 onnxruntime 就够用。`provider=cpu` / `--stop` / `--help`
+这些短路径照旧一行 ORT 都不 import。
 
 实测过的数（GPU，4060）：单文件 40 s 量级的中文素材 **RTF ≈ 0.08**。
 
@@ -257,7 +280,7 @@ I/O 契约（与 `CrispASR-Qwen/`、`cpu` 分支那两份逐条相同）：
   10-08 之后把"CLI 不给 `-bs` 时那个默认值到底是几"这条从推断升级成了读码（等级 A，`git show d08ec2d` 可复现）：
   CLI 的活参数表是 `examples/cli/whisper_params.h:31`，`int32_t beam_size = -1;`，行尾注释写着
   "-1 = greedy; beam search only when explicitly set via -bs N" —— **这句注释对 qwen3 成立（`-1 > 1` 为假 ⇒ 不进
-  beam 分支），对 AED 不成立**，因为上面那条适配器三元式把 -1 折成了 3。另：`cli.cpp:69` 那份带
+  beam 分支），对 AED 不成立**，因为上面那条适配器三元式把 -1 折成了 3。另：`examples/cli/cli.cpp:69` 那份带
   `whisper_full_default_params(...)` 的参数表整体在 `#if 0` 死块里（`:56` 起），早先"CLI 默认取自 whisper 默认参数"
   那句是读错了活代码，作废。
   要知道自己拿到的是哪一档，就对着日志里 `firered_asr: decoder starting (max_len=…, beam=…, …)`
@@ -267,14 +290,14 @@ I/O 契约（与 `CrispASR-Qwen/`、`cpu` 分支那两份逐条相同）：
 * **温度（`-tp/--temperature`）不是 AED 的旋钮**（A，读码）：`--help` 那行
   （`examples/cli/cli.cpp:1046-1047`，默认 0.00）是通用的，但 firered 适配器全文不读
   `params.temperature`，`src/firered_asr.cpp` 也没有这个符号，能力表里没置 `CAP_TEMPERATURE`
-  （`crispasr_backend_firered_asr.cpp:36-37`）⇒ 对 AED 传 `-tp` 是被静默忽略。
-  真读它的是 LLM 那类后端：`crispasr_backend_qwen3.cpp:370` 塞进解码配置，`:396-399` 只在
+  （`examples/cli/crispasr_backend_firered_asr.cpp:36-37`）⇒ 对 AED 传 `-tp` 是被静默忽略。
+  真读它的是 LLM 那类后端：`examples/cli/crispasr_backend_qwen3.cpp:370` 塞进解码配置，`:396-399` 只在
   `temperature > 0` 时才把 argmax 换成 `sample_temp`（`src/core/greedy_decode.h:114`：logits 除以 T
   → softmax → 按分布抽，配 `--seed`），`:374` 的 `n_runs = (T > 0 && best_of > 1) ? best_of : 1`
   说明 **qwen3 的"多条路径"是 best-of-N 独立采样再取累计分（`:429-430` 打 `best-of-N picked score=`），
   不是 beam**；beam 那路要 `-bs > 1` 才走（`:269-305`，`core_beam_decode`）。
-  `--temperature-inc`（默认 0.2）全文只被 whisper 家族读（`cli.cpp:2997`、
-  `crispasr_backend_crispasr.cpp:120`），AED 与 qwen3 都不认。
+  `--temperature-inc`（默认 0.2）全文只被 whisper 家族读（`examples/cli/cli.cpp:2997`、
+  `examples/cli/crispasr_backend_crispasr.cpp:120`），AED 与 qwen3 都不认。
 
 **③ 每个切片的解码上限是硬顶 150 token，没有任何 CLI 参数能改 —— 所以 `--chunk-seconds` 不是速度参数。**
 
@@ -345,7 +368,7 @@ I/O 契约（与 `CrispASR-Qwen/`、`cpu` 分支那两份逐条相同）：
   有把握，也**没有**"拿不准就按主链/按兜底"这条余量可留。whisper 那件给的是真概率
   （旧筛子日志里见过 `p=0.41`、`p=0.405`）。
 * **判别失败不会退回 whisper，而是钉成 `en`。** firered 分支失败只打
-  `crispasr[lid]: firered LID failed` 就 return false（`crispasr_lid.cpp:196-235`，
+  `crispasr[lid]: firered LID failed` 就 return false（`src/crispasr_lid.cpp:196-235`，
   `out.source` 保持 `"firered"`），随后 `examples/cli/crispasr_run.cpp:1013-1021` 因为
   `-l auto` 没给具体码而 `params.language = "en"` 并打一行
   `crispasr: LID failed and no -l was set — defaulting to 'en'`。`en` 在 AED 的覆盖范围内
@@ -642,7 +665,7 @@ import 干净、`CUDAExecutionProvider` 在列、3.1 GB 的 f32 编码器会话�
   都得先确认自己喂的是哪一种命令形状。
 * **上面那条不影响 `_lid_map` 的对号**：它只匹配 `LID -> language = '…'`
   （`Flid-Cg-firered-Cg-qwen.py:1259` 那个 `_LID_RE`），而这一行 crispasr 每文件只打一次 —— 两处打印点
-  `crispasr_run.cpp:986` 与 `:1003` 由 `probed_ok` 互斥，严格管线那趟在 `:5059` 同样只一次；
+  `examples/cli/crispasr_run.cpp:986` 与 `:1003` 由 `probed_ok` 互斥，严格管线那趟在 `:5059` 同样只一次；
   `auto-detected language:` 那些逐段行根本进不了它的队列，所以"逐段三个码"打不乱顺序对号。
   g4 实测 3 件出 3 个事件，没触发"整批不采信"。残留风险按机制写在这：真出现"一件两行 `LID ->`"
   会撞 `len(events) > len(queue)` ⇒ **整批不采信**（失败方位是安全的，等于这次没兜底）；
@@ -670,6 +693,12 @@ import 干净、`CUDAExecutionProvider` 在列、3.1 GB 的 f32 编码器会话�
   墙钟，没测；②它在**本语料上的召回**——旧筛子那组 head15/head30 对照（§6.6 末条）是
   ggml-tiny 的数，判别器换掉以后没重测，而它只看头 5 秒。
   这两笔是"要不要换档（f16/q8_0/q2_k）或换回 whisper"的全部依据缺口。
+  **10-16 更新**：出厂默认已经改成 `LID_ROUTER="frame"`，而帧级路由那条腿**根本不挂批内筛子**
+  （`_crispasr_batch(..., lid_off=True)`），所以 ① 在默认配置下是一个不会再走的路径 —— 它只在
+  降级成 `sieve` 或显式 `ASR_LID_ROUTER=sieve` 时才又是现役。② **仍然全量欠着**，而且帧级
+  没有把它补上：路由改的是【看到多少音频】，不是【判得准不准】，判成 zh 的外语文件照样被 AED
+  拿汉字编造并正常落盘。路由自己那笔新账（每文件一次整条编码的秒数）也没量过 —— 驱动逐文件在
+  日志里打 `vad X.XXs + ffmpeg X.XXs + lid X.XXs`，第一批跑完就有数。
 * `crispasr` 腿在这台笔记本上只量了整腿（g4）和 AED 腿单件的 GPU 占用（g5）；
   **beam 档、qwen3 兜底腿单独的速度都还没在这台机器上量过**。
 * `ONNX_MODE` 仍是 `greedy`：beam 在 ONNX 链里实现了但未调通（慢 9 倍、输出退化）。
@@ -679,3 +708,109 @@ import 干净、`CUDAExecutionProvider` 在列、3.1 GB 的 f32 编码器会话�
   音频，而闸门已经是每文件 1.1–1.8 s 里的大头），收益没有实测。
 * 分语种验证集仍没有（与 `cpu` 分支同一条洞）。
 * Linux 侧只到机制，没有实机跑过。
+
+## 7. 帧级语种路由（10-16，`LID_ROUTER="frame"`，出厂默认）
+
+她的原话是判据：**"不是检出多语就换 Qwen，而是检出 firered 不支持的才换……crisper 的 lid
+能对整个文件跑吗，不能的话就用 onnx 吧，这样才能确保整个文件都是 firered 支持或不支持的，
+日语或其他小红书不支持的语言占比要到起码三段才切换 Qwen，以防误判。"** 下面每一条都对着一句。
+
+### 7.1 为什么必须走出 crispasr
+
+"能不能对整个文件跑"这个问题的答案是**不能**，三条都读到了源码级：
+
+* `src/crispasr_lid.cpp:284` —— 外部判别器入口把输入截到 `kLidMaxSamples = 16000 * 15`；
+* `src/firered_lid.cpp:78` —— FireRed 适配器在里面**再截到** `kMaxLidSamples = 16000 * 5`，
+  注释自己写了理由："The encoder is O(T²) per layer, so halving T gives 4x speedup"；
+* `examples/cli/cli.cpp:496-500` —— CLI 只有 `--lid-backend` / `--lid-model` /
+  `--lid-on-transcript` 三个语种旋钮，**没有任何窗口/时长参数**。
+
+所以"整个文件都在 FireRed 支持之列"这句话，crispasr 自己给不出来；能给的只有那条
+`onnx/optional-lid/lid_onnx.py`（她自己导的 FireRedLID ONNX），它按滑窗逐窗解码、不截断。
+这就是路由为什么落在 crispasr **之外**：先判完再决定喂不喂 AED，而不是像筛子那样在进程里
+判、拦不住已经开跑的转写。
+
+`p=` 恒为 1.0（`src/firered_lid.cpp:90` 写死，那行注释是 beam search 取 argmax、不产出概率），
+**结构上没有置信度闸门可加** —— 所以"以防误判"只能做成计段：`FRAME_LID_MIN_BAD_SEGS = 3`。
+
+### 7.2 形状：四步，后两步复用 `asr_chain.run_lid`
+
+`frame_route()`（驱动里那一支）对每个文件做：
+
+1. **FireRedVAD 导段** —— 用 `CRISPASR_VAD_MODEL`，**不是**语种闸门那份 silero。理由硬：
+   silero v6.2.0 对唱歌素材判 0 段（数字依据在 CONFIG · VAD 那组），而唱歌正是最需要换引擎的
+   那片；FireRedVAD 与主引擎同源，分出来的段就是 AED 真正会吃到的那套分段。
+2. **读成链路口径的 PCM** —— `_gate_load_audio()`（libsndfile）失手就交给 `_ffmpeg_decode()`。
+3. **切子段 + 打包分块** —— `_split_units()` 把每条 VAD 段切成 ≤`FRAME_LID_UNIT_SEC`（6 s）互不
+   重叠的子段，短于 1 s 的尾巴丢掉；`_run_lid_blocks()` 再把相邻子段打包成 ≤`FRAME_LID_SLICE_SEC`
+   （60 s）的块，**每块各自编码一次**，返回的时间戳一律加回块起点还原成绝对秒。
+   为什么要切子段：一条十分钟的日语独白在 VAD 下常常只有一两段（10-09 校机实测 80.2 s 素材的
+   段表只有一条 `0.03–79.55 s`，记在 `_speech_prefix`），不切的话"≥3 段"永远达不成。
+   为什么要分块：编码器是 Conformer 全自注意力，分数矩阵随时长**平方**涨（十分钟素材
+   T=15000 帧 @25 帧/s，单层 4 头 ≈ 4×15000²×4 B ≈ 3.6 GB），夜间无人值守会被它撑死；
+   分块后总代价 ∝ ΣTᵢ² 比整条**更小**，只有块边界上的窗少看几十秒上下文，而 3 s 窗判语种用不着。
+4. **滑窗解码 + 按子段汇票** —— 直接调 `chain.run_lid(..., win_s=3.0, hop_s=1.5, mode="slice")`，
+   与单文件跑 `--lid` 时同一条实现，**不复制一份代码**。
+
+判据只有一条：`_in_aed_range()` 判到范围外的**子段数** ≥ `FRAME_LID_MIN_BAD_SEGS`。
+范围 = 中文（含 `zh mandarin` / `zh xinan` / `zh min` / `zh wu` / `zh xiang` / `zh yue` /
+`zh north` 这些方言二词）/ 英语 / 粤语；词表里那个真实的 `"other"` 类和任何范围外码都算坏票。
+
+日志每文件一行，长这样（能直接读出这一条判据的证据链）：
+
+```
+80s 音频 / VAD 1 段 → 子段 14、窗 14(slice 3s/1.5s,每块≤60s,1 块) → 有票 14、范围外 14 [ja×14] 整条=ja | vad 0.31s + lid 1.42s
+```
+
+### 7.3 三种"不换引擎"是三件不同的事，必须分得开
+
+* 有票、范围外子段不够 3 ⇒ **放行**（这就是她那句"不是检出多语就换"）。
+* `votes=0`（VAD 零段 / 两种解码器都读不了 / 子段全无窗覆盖 / 会话没起来）⇒ **不路由**。
+  "看不见"不等于"范围外"，与语种闸门那条同一口径；否则路由自己一坏就把整棵树拖去兜底引擎
+  —— 那是比编造更难查的坏：一夜文件全换了引擎，而判据一条都没有。
+* 判成 zh 的外语文件 ⇒ **放行，且这是已知假阴性**。帧级改的是【看到多少音频】，不是
+  【判得准不准】；这一层没有任何东西收得住。
+
+放行的那部分走 `_crispasr_batch(..., lid_off=True)`：**主链那趟不挂前置判别器**，顺带省掉
+`examples/cli/crispasr_run.cpp:1029` 那个每文件重装 543 MB 筛子的开销（`crispasr_lid_free_cache()`
+是 #35 显存 OOM 的修补，效果就是缓存在批内每个文件都要重建一次）。被路由扣下的文件**根本不喂
+AED**，攒成一批换 qwen3 重跑，`process_batch` 的形状不用改（`results` 里 = 已产出，`flagged`
+里 = 待兜底，两处都没有 = 逐文件重跑）。
+
+### 7.4 起批前的降级门禁
+
+`frame_router_setup()` 返回 0 = 按配置走、1 = **整条路由降级成批内筛子**、2 = 致命（配置本身不对）。
+查的是"能不能建成会话"，不是"文件名在不在"——external data 缺件、ORT 版本不认这张图、
+`kaldi_native_fbank` 没装，只有真建一次才看得见。三道关：
+
+| 缺什么 | 后果 | 为什么这样处置 |
+|---|---|---|
+| `LID_ROUTER` 写了 `frame`/`sieve`/`off` 之外的值 | rc 2，不起批 | 拼错的字符串静默退回默认等于悄悄换了一条路由 |
+| 起批前点验的四条路径缺任一件（`lid_encoder.onnx` / `lid_decoder_step.onnx` / `dict.txt` / `cmvn.ark`），或 VAD 不在，或会话建不起来 | rc 1 → 降级 `sieve`，critical 写清缺哪几件与补法 | 这些都是**建造产物**（`onnx/optional-lid/lid_export.py`，要 torch + FireRedASR2S 仓库 + 官方 `model.pth.tar`），不在任何下载清单里。两张图连各自的 `.onnx.data` 合计 3,552,376,747 B，校机 `models` 下已有整套，**笔记本上没有**。那两个 `.data` 大文件**不在点验清单里** —— 缺它们时文件路径全在、只有真建一次会话才看得见，这正是 `frame_router_setup()` 走"建会话"而不是"查文件名"的原因 |
+| `ffmpeg` 找不到或跑不起来 | rc 1 → 降级 `sieve` | 见下 |
+
+ffmpeg 那道关为什么是**整条降级**而不是"这三种容器跳过"：能读的走帧级、读不了的退回筛子，
+需要在同一批里开两个 crispasr 进程（`--lid-backend` 挂在命令行上，不是按文件给的）；而"这台
+机器有没有能用的 ffmpeg"是**环境属性**，不是单个文件的属性 —— 起批前一次判清、整批只走一条路、
+日志只有一种形状。降级成筛子 = 退回 10-16 之前的行为，不是雪上加霜；留着不管才是给 m4a/mp4/aac
+开一个**连筛子都没有**的洞，而小红书下载下来的封装恰好主要是这一类。
+
+`frame_selfcheck()` 再拿队列头几个文件实跑一次（`GATE_SELFCHECK_FILES`）。这层不能省：路由坏了
+**不产生任何错误** —— crispasr 照常返回 0、AED 照常出字，只是每个文件都"没证据 ⇒ 不路由"，
+整批外语素材被编成汉字并正常落盘（与 `--no-prints` 把筛子搞瞎那个坑同源）。但它**不判致命**，
+只 warning：唱歌素材 VAD 判 0 段是这类语料的已知合法形态，头几个文件恰好全这种素材不等于路由坏了，
+拿它停机是把正常素材当故障。
+
+### 7.5 还没量的与残留盲区
+
+* **每文件的代价没量过**。路由多花的是整条音频的一次编码（跑在 CPU，`lid_onnx.py` 建会话时
+  providers 写死 `CPUExecutionProvider`，驱动没改那个文件，所以不涉及 `GPU_PY` 那套换解释器）。
+  日志逐文件打 `vad + ffmpeg + lid` 秒数，批末再打 `s/文件`，第一批跑完就有数。
+* **显存无关，RAM 有关**：会话常驻 = 编码器 + 解码器两张图的 external data 一次读进本进程。
+  换来的是不再有那个"每文件重装 543 MB"，且这趟跑在 crispasr 之外，主模型的显存分配与它无关。
+* **残留盲区只剩一条**：libsndfile 与 ffmpeg **都**解不了的音频 —— 它会照旧喂 AED 且**不挂筛子**
+  （`_ffmpeg_decode` 为它单独打 warning，名字和退出码留得下）。这是 `frame_route()` 里唯一
+  一处"整条判不了"的形状，其余分支都有降级。
+* **onnx 腿不受影响**：路由只在 `PRIMARY_LEG="crispasr"` 生效，那条腿的语种闸门
+  （silero + whisper-tiny `-dl`）原样不动（她 10-14 定的"ort 不换"）。把闸门也换成帧级是后续的事。
+* 想退回 10-14 的行为：`ASR_LID_ROUTER=sieve`（每文件只看前 5 s）或 `off`（整批不挑文件）。

@@ -2,28 +2,44 @@
 # crispasr.exe 那两条腿（python 侧只负责拼命令行、读 stderr），和本包 onnx/ 里的
 # FireRedASR2S ONNX 全链路（python 侧就是推理本身）。
 #
-# 驱动本身只用 ctypes/logging/os/re/signal/subprocess/sys/tempfile/threading/time/
+# 驱动本身只用 ctypes/logging/os/re/shutil/signal/subprocess/sys/tempfile/threading/time/
 # urllib.request/contextlib/datetime/pathlib(+ itertools，暂存链接的自增序号)，
 # 加上 Windows 的 msvcrt 与 POSIX 的 fcntl 抢 .lock、ctypes 包 Job Object，
-# ntfy 推送走 urllib，不引第三方 HTTP 客户端。
+# ntfy 推送走 urllib，不引第三方 HTTP 客户端。shutil 是 10-16 为帧级路由加的
+# （shutil.which("ffmpeg") 那一行，找 libsndfile 不认的容器 m4a/mp4/aac 的解码器）。
 # send2trash 是必需件：驱动顶部的 `from send2trash import send2trash` 是模块级 import，
 # 装不上就直接 ImportError 起不来。
 #
-# 关键一条：PRIMARY_LEG 默认就是 "onnx"，所以下面那 6 件【现在也是必需件】，
-# 不是可选项。驱动 main_loop() 会在起批前 import 一次并当场报错退出（rc=2），
-# 不会等跑到第一个文件才发现。想只跑 crispasr 那两条腿，把 PRIMARY_LEG 改成
-# "crispasr"，那 6 件就可以不装（onnx_leg_setup() 那条自检也随之整体跳过）。
+# 关键一条（10-16 更正）：这里下面那 6 件【在出厂默认的 crispasr 腿上也是必需件】，
+# 理由换了。旧说法是"PRIMARY_LEG 默认就是 onnx 所以必需" —— 那句自 10-14 起就过期了
+# （默认腿已翻回 crispasr），**在此公开更正**：现在必需是因为 10-16 的帧级语种路由
+# （LID_ROUTER="frame"，README §7）在 crispasr 之外建 FireRedLID 的 ONNX 会话，
+# 于是 numpy / onnxruntime / soundfile / scipy / kaldi-native-fbank / kaldiio 这六件
+# 在默认腿上就被 import；tokenizers 是例外，它只在 ONNX 那条 AED 链里用（aed_ort 的
+# 分词），路由不碰它。main_loop() 起批前就 import 并当场报错退出，不会等跑到第一个
+# 文件才发现。
+# 想只要 crispasr 那两条腿、一件 ORT 都不装：显式给 ASR_LID_ROUTER=sieve（每文件只看
+# 前 5 秒的批内筛子，= 10-16 之前的行为）或 off（整批不挑文件）。onnx_leg_setup() 那条
+# 自检也随之整体跳过。
 
 Send2Trash==2.1.0
 
-# ---------- ONNX 主链（PRIMARY_LEG="onnx" 时必需）----------
-# 出厂 provider 已经是 cuda（10-09 从 cpu 改的），所以下面钉的 onnxruntime==1.20.1 那份
-# 【纯 CPU 包】现在只服务两种机器：显式给了 FIREDASR_ONNX_PROVIDER=cpu 的无独显机器，
-# 和只想跑 crispasr 两条腿的人。有 N 卡的机器请按本节最后那段换成 onnxruntime-gpu，
-# 否则会撞在起批前那道 enc_ep 断言上 —— 那是设计好的当场停，不是偷偷退回 CPU 跑完整夜。
+# ---------- ONNX 侧的库（PRIMARY_LEG="onnx" 必需；默认腿被帧级路由拉动，见文件头）----------
+# 出厂 provider 已经是 cuda（10-09 从 cpu 改的），但那只作用于 onnx 腿。下面钉的
+# onnxruntime==1.20.1 是【纯 CPU 包】，它服务三种机器：
+#   · 显式给了 FIREDASR_ONNX_PROVIDER=cpu 的无独显机器；
+#   · 只跑 crispasr 腿、但留着帧级路由（默认）的机器 —— 路由那条会话落在 CPU，
+#     lid_onnx.py 建 InferenceSession 时 providers 写死 CPUExecutionProvider，
+#     所以它【不需要】onnxruntime-gpu，也不会去碰 GPU_PY 那套换解释器的事；
+#   · 只想跑 crispasr 两条腿且把路由降级成 sieve/off 的人（这时整套都可以不装）。
+# 走 onnx 腿且有 N 卡的机器请按本节最后那段换成 onnxruntime-gpu，否则会撞在起批前那道
+# enc_ep 断言上 —— 那是设计好的当场停，不是偷偷退回 CPU 跑完整夜。那条断言在 crispasr 腿
+# 上不会触发（onnx_leg_setup() 按腿分支，默认腿整个跳过）。
 # 与 cpu 分支的 onnx/requirements.txt 同一套 pins，逐字对拍就是在这套上过的
 # （10-06 产线 CPython 3.12.15 + 10-06 干净机 CPython 3.13.11 两轮都跑通）。
 # 版本、为什么钉 1.20.1、punc 的 4-bit 坑，都写在 onnx/requirements.txt 里，那里是单一权威。
+# 六件里只有 tokenizers 不被路由拉动：它只在 aed_ort 的分词里 import（ONNX 那条 AED 链），
+# 路由只走 lid_onnx。
 numpy==2.5.3
 onnxruntime==1.20.1
 soundfile==0.14.0

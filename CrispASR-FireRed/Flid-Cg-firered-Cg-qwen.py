@@ -52,7 +52,7 @@ CrispASR 批量转写驱动(Windows) —— FireRed AED 主引擎 + qwen3 兜底
         属于未核(标 C)。所以【假阴性会漏】这条结论仍然保留,但漏多少不知道。
     仍然成立的部分:判成 zh 的外语文件会被 AED 编造一段话并正常落盘,这一层没有兜底;
     假阳性的代价只是白跑一遍 qwen3(它反而快 5 倍)。
-    前置判别每文件都要重装一次筛子模型(crispasr_run.cpp:1021 的 crispasr_lid_free_cache()
+    前置判别每文件都要重装一次筛子模型(crispasr_run.cpp:1029 的 crispasr_lid_free_cache()
     是 #35 显存修补)。代价变了:whisper-tiny 那份 77 MB,FireRedLID q4_k 这份 543 MB
     —— 每文件重装的东西大了 7 倍,而【这个开销没有量过】,见 CONFIG · 语种。
     它默认还占显存:firered_lid_init 走 firered_asr 的默认参数,那份参数里 use_gpu = true
@@ -142,6 +142,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -183,6 +184,13 @@ def resolve_dir(env_name, default_rel):
 # 两个引擎共用同一个 crispasr.exe(qwen3 与 firered-asr 都在同一个二进制里)。
 CRISPASR_BIN_DIR = resolve_dir("CRISPASR_BIN_DIR", "crispasr")
 CRISPASR_EXE     = os.path.join(CRISPASR_BIN_DIR, "crispasr.exe")
+# ffmpeg 只在帧级路由(LID_ROUTER="frame")那条腿上用,而且只解 libsndfile 认不了的容器
+# —— m4a / mp4 / aac,而这三种正是小红书下载的主流封装(EXTENSIONS 里都列着)。
+# crispasr 自己带一份静态链进的 ffmpeg(所以它什么都能吃),但那是库不是可执行文件,
+# python 侧拿不到,只能另外找一个。空串 = 没找到;frame_router_setup() 会为此把路由降级成
+# 批内筛子(等于回到"每个文件只看前 5 秒"),不会让这类文件悄悄躲过一切语种判别。
+FFMPEG_EXE = (os.environ.get("ASR_FFMPEG", "").strip()
+              or (shutil.which("ffmpeg") or ""))
 
 # ---------- 模型目录与全部权重 ----------
 MODEL_DIR = resolve_dir("CRISPASR_MODEL_DIR", "model")
@@ -564,7 +572,7 @@ CRISPASR_LANGUAGE = "auto"
 #
 # 代价账(两条是新账,量过的只有 whisper-tiny 那批):
 #   · 每个文件多跑一次筛子。AED 的 962 MB 权重此时已经驻留,是额外分配;跑完 crispasr
-#     会调 crispasr_lid_free_cache() 释放(crispasr_run.cpp:1021 注释,那是 #35 显存 OOM
+#     会调 crispasr_lid_free_cache() 释放(crispasr_run.cpp:1027-1028 注释,那是 #35 显存 OOM
 #     的修补)—— 也就是说这个缓存在批内【每个文件都要重建一次】,不是我原先写的"每批一次"。
 #     whisper-tiny 那版量到 45 s 组 +1.8 s/文件、120 s 组不复现(第 (5) 条)。
 #     ⚠ 换 firered 后每文件重装的东西从 77 MB 变成 543 MB(q4_k),驱动还设了
@@ -769,6 +777,101 @@ ONNX_VAD_DIR  = resolve_dir("FIREDASR_ONNX_VAD_DIR",
 ONNX_PUNC_DIR = resolve_dir("FIREDASR_ONNX_PUNC_DIR",
                             os.path.join(ONNX_MODELS_DIR, "fireredpunc-onnx"))
 ONNX_PUNC_FILE = os.environ.get("FIREDASR_ONNX_PUNC_FILE", "")   # 空 = 先 punc.f32.onnx
+
+# ---------- 帧级语种路由(LID_ROUTER)----------
+#
+# 三种挑文件的方式,只对主链(ENGINE_PRIMARY)有效,兜底那趟永远不筛自己:
+#   frame  整文件、帧级 —— 本驱动自己起一份 FireRedLID ONNX 会话(onnx/optional-lid/lid_onnx.py,
+#          纯 onnxruntime,不依赖 torch 也不依赖 sherpa-onnx),在把文件喂给 crispasr 之前先跑完
+#          【整条】音频,按 VAD 段汇出每段语种,判到 AED 范围外【且占满三段】才把整个文件扣下换 qwen3。
+#   sieve  批内、前 5 秒 —— 10-14 那一版:crispasr 的 --lid-backend firered 判一次,驱动从
+#          stderr 的 `crispasr: LID ->` 行对号挑文件(实现是 _lid_map 那一套)。
+#   off    不挑文件,AED 一条道跑到黑。
+#
+# 为什么默认换成 frame:crispasr 的前置判别器【跑不了整文件】,这是读源码读出来的死路 ——
+# src/crispasr_lid.cpp:284-286 在分发给任何判别器之前就把音频截到 15 s
+# (constexpr int kLidMaxSamples = 16000 * 15),firered 那一支 src/firered_lid.cpp:78-79 再截一次
+# 到 5 s,而 CLI 根本没有窗口参数(--lid-backend / --lid-model / --lid-on-transcript 三个,
+# examples/cli/cli.cpp:496-500)。于是"前 15 秒是音乐、后面两小时是日语"这种文件在 sieve 下
+# 【必然判错】,而且错的方向不一定 —— 片头判成 zh 就把整条留给 AED 编汉字。帧级这条是一次编码
+# 整条音频(process_windows 的 mode="slice",窗=编码器输出的时间切片),所以"整个文件到底是
+# AED 能判的还是不能判的"这个问题第一次拿到整文件的答案。
+#
+# 为什么要"占满三段"才换:单点误判太便宜。判别器给的 p= 恒 1.0(src/firered_lid.cpp:90
+# "beam search returns argmax, no explicit probability"),结构上没有置信度闸门可用;窗级投票
+# 一次只看 3 s,一段环境音或一句英文人名就可能翻出一个范围外标签。按 FRAME_LID_MIN_BAD_SEGS=3
+# 计段 ⇒ 换引擎要三段独立证据,而假阳性的代价本来只有"白跑一遍 qwen3"(0.19 RTF,比 AED 快 5 倍)。
+# 假阴性仍然在:判成 zh 的外语文件照样被 AED 用汉字编造并正常落盘,这一层没有任何东西收得住 ——
+# 帧级改的是【看到多少音频】,不是【判得准不准】。
+#
+# 计数的"段"= VAD 段,但长段先按 FRAME_LID_UNIT_SEC 切成子段。必须切:一条十分钟的日语独白在 VAD
+# 下常常就一两段(10-09 校机实测 80.2 s 素材的段表只有一条 0.03–79.55 s,记在 _speech_prefix 里),
+# 不切的话"≥3 段"永远达不成,整条外语文件照样被编造。切完之后"三段"= 三段互不重叠的子段,
+# 合计至少 18 s 的范围外证据,误判闸门照样管用。
+#
+# VAD 用的是 CRISPASR_VAD_MODEL(FireRedVAD),不是语种闸门那份 silero:silero v6.2.0 对唱歌素材
+# 判 0 段(依据见 CONFIG · VAD 那组数字),而唱歌正是最需要换引擎的那片;FireRedVAD 与主引擎同源,
+# 分出来的段就是 AED 真正会吃到的那套分段。
+#
+# 代价(这条【没量过】,每个文件都在日志里打秒数,第一批跑完就有数):
+#   · 会话常驻 = 编码器 + 解码器两张图的 external data 一次读进本进程,换来的是不再有 sieve
+#     那个"每个文件重装一遍 543 MB" —— crispasr_run.cpp:1029 每个文件都调
+#     crispasr_lid_free_cache()(那是 #35 显存 OOM 的修补),而路由这趟跑在 crispasr 之外,
+#     主模型的显存分配与它无关。
+#   · 每个文件多一次整条音频的编码。跑在 CPU 上:lid_onnx.py 建会话时 providers 写死
+#     CPUExecutionProvider,想上卡要改那个文件,本驱动没改(便宜档),也因此【不涉及】GPU_PY
+#     那套换解释器的事 —— 系统 python 里那个只有 CPU EP 的 onnxruntime 就够用。
+#
+# 容器:路由要拿到【PCM】,而 libsndfile 只认 wav/flac/ogg/oga/opus/mp3,m4a / mp4 / aac
+# 不认(那三种原来是 crispasr 内部静态链的 ffmpeg 解的,python 侧够不着)。所以这条腿额外
+# 要求一个能跑的 ffmpeg 可执行文件,只在 libsndfile 失手时接管 —— 小红书下载下来的封装
+# 恰好主要是这一类,"整文件都判过"这句话没有它就只对 wav/mp3 成立。找不到或跑不起来 ⇒
+# frame_router_setup() 整条降级成批内筛子(= 改动前的行为),不留"这三种连筛子都没有"的洞。
+#
+# 一次编码的长度上限(FRAME_LID_SLICE_SEC):编码器是 Conformer 全自注意力,分数矩阵随时长
+# 平方涨,整条十分钟的素材单层就要 3.6 GB。按子段打包成 ≤60 s 的块、每块各自编码,总代价
+# ∝ ΣTᵢ² 比整条【更小】,只有块边界上的窗少看几十秒上下文(3 s 窗判语种用不着)。
+#
+# 权重从哪儿来:两张图 + dict.txt/cmvn.ark 都是【建造产物】,不在任何下载清单里 —— 要 torch、
+# git clone FireRedASR2S、官方 model.pth.tar,再跑 onnx/optional-lid/lid_export.py。
+# 两张图连各自的 .onnx.data 合计 3,552,376,747 B(10-06 在校机上逐件算的,字节与 sha256 在
+# cpu 分支那份 README 的导出表里)。校机的 models 目录下已经有整套;笔记本上【没有】,
+# 在那儿跑会当场降级回 sieve 并在日志里写清缺了什么。
+# 那两个 .data 大文件【不在】frame_router_setup 的点验清单里 —— 缺它们时路径全在、
+# 只有真建一次会话才看得见,所以那一步查的是"能不能建成会话"而不是"文件名在不在"。
+#
+# 只在 PRIMARY_LEG="crispasr" 时生效。onnx 腿的语种闸门(silero + whisper-tiny -dl)原样不动,
+# 它本来就只在 onnx 腿跑;把闸门也换成帧级是后续的事,现在改它等于动一条已经跑过生产的路由。
+LID_ROUTER = (os.environ.get("ASR_LID_ROUTER") or "frame").strip().lower()
+FRAME_LID_MIN_BAD_SEGS = int(os.environ.get("FIREDASR_LID_MIN_BAD_SEGS") or 3)
+FRAME_LID_UNIT_SEC = float(os.environ.get("FIREDASR_LID_UNIT_SEC") or 6.0)
+FRAME_LID_MIN_UNIT_SEC = 1.0   # 短于此的子段丢掉:凑不满一个窗,只会白占计数不产证据
+FRAME_LID_WIN_SEC  = float(os.environ.get("FIREDASR_LID_WIN_SEC") or 3.0)
+FRAME_LID_HOP_SEC  = float(os.environ.get("FIREDASR_LID_HOP_SEC") or 1.5)
+FRAME_LID_MODE     = (os.environ.get("FIREDASR_LID_MODE") or "slice").strip().lower()
+# 一次编码覆盖多少秒音频。mode="slice" 是"整条编码一次",而编码器是 Conformer 全自注意力,
+# 分数矩阵随时长平方涨:十分钟素材 T=15000 帧(25 帧/秒),单层 4 头就是 4×15000²×4 B≈3.6 GB,
+# 夜间无人值守时会被它撑死。所以路由把子段打包成至多这么长的若干段,每段各自编码一次 ——
+# 边界上的窗少看几十秒上下文,而 3 s 窗判语种用不着长上下文;总注意力代价 ∝ ΣTᵢ²,
+# 分段比整条【更省】而不是更贵。0 = 不切,整条一次编码(只在确定素材都很短时才这么给)。
+FRAME_LID_SLICE_SEC = float(os.environ.get("FIREDASR_LID_SLICE_SEC") or 60.0)
+FRAME_LID_THREADS  = int(os.environ.get("FIREDASR_LID_THREADS") or
+                         max(2, (os.cpu_count() or 8) // 2))
+FRAME_LID_ONNX_DIR = resolve_dir("FIREDASR_LID_ONNX_DIR",
+                                 os.path.join(ONNX_MODELS_DIR, "FireRedLID-onnx"))
+FRAME_LID_DICT_DIR = resolve_dir("FIREDASR_LID_DICT_DIR",
+                                 os.path.join(ONNX_MODELS_DIR, "FireRedLID"))
+
+
+def _frame_router_wanted() -> bool:
+    return LID_ROUTER == "frame" and PRIMARY_LEG == "crispasr"
+
+
+def _router() -> str:
+    """生效中的路由方式。frame 建会话失败就在起批前翻成 sieve(main_loop 会当场报原因)。"""
+    if _frame_router_wanted() and _frame_lid is not None:
+        return "frame"
+    return LID_ROUTER if LID_ROUTER != "frame" else "sieve"
 
 # ---------- 执行提供者:只用 N 卡 ----------
 # cpu = 纯 CPU;cuda = CUDA EP(只会挑中 NVIDIA 独显)。这条链【不列】DirectML 与
@@ -1300,7 +1403,23 @@ def _can_read_lid() -> bool:
 
 
 def _sieve_on(engine: str) -> bool:
-    return (_can_read_lid() and USE_LID_FALLBACK and engine == ENGINE_PRIMARY)
+    """批内筛子这一路生效吗:只有【生效的路由方式就是 sieve】时才生效。
+
+    frame 时挑文件已经在喂 AED 之前按整文件做完了,再让前 5 秒的结论参与扣文件就是两套
+    判据抢同一个开关;off 时她明说了不挑文件。
+    """
+    return (_can_read_lid() and USE_LID_FALLBACK and engine == ENGINE_PRIMARY
+            and _router() == "sieve")
+
+
+def _sieve_off_for_primary(engine: str) -> bool:
+    """主链那趟的命令要不要【不挂】前置判别器。
+
+    判据是"它的结论有没有人用":筛子不生效的两种方式(frame / off)都没人用,留着只白付
+    一次 crispasr_run.cpp:1029 那个每文件重装 543 MB 的重载。
+    兜底引擎(engine != ENGINE_PRIMARY)永远要挂 —— qwen3 是真吃 -l 的。
+    """
+    return engine == ENGINE_PRIMARY and _router() != "sieve"
 
 
 def _sieve_hit_single(err: str):
@@ -1422,9 +1541,15 @@ def staged_inputs(files: list):
 
 # ==================== 转写 ====================
 
-def _base_cmd(engine: str = ENGINE_PRIMARY):
+def _base_cmd(engine: str = ENGINE_PRIMARY, lid_off: bool = False):
     """拼命令骨架。两个引擎只差 --backend / -m / 要不要 --punc-model 与 -bs,
     其余(VAD、分块、-l auto、前置判别、严格管线)完全一致 —— 差别写在 ENGINES 里。
+
+    lid_off=True 时前置判别器不挂(--lid-backend off)。只有帧级路由下的【主链那趟】这么给:
+    文件早就按整条音频挑完了,再挂 543 MB 的筛子只会多一份每文件重载(crispasr_run.cpp:1029
+    每个文件都 free_cache 一次)。兜底那趟【不能】传它 —— qwen3 是【真】吃 -l 的
+    (crispasr_backend_qwen3.cpp:180-184 把语种码拼进 assistant 前缀),前置判别器给的码就是
+    它那趟的语种输入;AED 反过来根本不吃这个标记,所以关掉它对主链的输出没有任何影响。
     """
     eng = ENGINES[engine]
     cmd = [
@@ -1461,9 +1586,12 @@ def _base_cmd(engine: str = ENGINE_PRIMARY):
     # 才追加 --lid-model,且必须指到本地文件,否则 crispasr 每个文件联网下载超时
     # (约 30 s)后按 crispasr_run.cpp:1017 强制 en 兜底。
     if CRISPASR_LANGUAGE == "auto":
-        cmd += ["--lid-backend", CRISPASR_LID_BACKEND or "off"]
-        if not _lid_is_off():
-            cmd += ["--lid-model", CRISPASR_LID_MODEL]
+        if lid_off:
+            cmd += ["--lid-backend", "off"]
+        else:
+            cmd += ["--lid-backend", CRISPASR_LID_BACKEND or "off"]
+            if not _lid_is_off():
+                cmd += ["--lid-model", CRISPASR_LID_MODEL]
     return cmd
 
 
@@ -1534,7 +1662,7 @@ def _run(cmd, on_tick=None, live=None):
 
 
 def _crispasr_batch(files: list, on_done=None, engine: str = ENGINE_PRIMARY,
-                     flagged=None):
+                     flagged=None, lid_off: bool = False):
     """
     一次调用转写多个文件。engine 用哪套引擎,配置见 ENGINES。
 
@@ -1551,6 +1679,10 @@ def _crispasr_batch(files: list, on_done=None, engine: str = ENGINE_PRIMARY,
     由 process_batch 攒起来换兜底引擎重跑。必须实时读是因为批内结算当场就删源文件,
     等整批跑完再拿到判别结论就来不及了。对号的规矩与错位风险写在 _lid_map 里。
     兜底那一趟不再设筛子(它什么语种都能转,再筛就是自己筛自己),但语种分布照常进日志。
+
+    lid_off=True(帧级路由下的主链那趟)时前置判别器根本不挂,所以这个函数里的筛子整体
+    不工作 —— 谁该交给兜底引擎已经在 transcribe_batch_frame 里按整文件定完了,传进来的
+    files 就是"该由 AED 跑"的那一部分。
 
     返回 (results, error):
         results —— {Path: 原始文本};未产出 .txt 的文件、以及被筛子扣下的文件都不在
@@ -1620,7 +1752,7 @@ def _crispasr_batch(files: list, on_done=None, engine: str = ENGINE_PRIMARY,
             if k > 0:
                 flush(k)
 
-        cmd = _base_cmd(engine)
+        cmd = _base_cmd(engine, lid_off=lid_off)
         with staged_inputs(files) as paths:
             staged_of.update({os.path.normcase(p): f for f, p in paths.items()})
             arg_index.update({os.path.normcase(p): i
@@ -1644,7 +1776,7 @@ def _crispasr_batch(files: list, on_done=None, engine: str = ENGINE_PRIMARY,
                 if on_done:
                     on_done(f, "")
 
-        if can_read:
+        if can_read and not lid_off:
             _lid_summary(_lid_map(live, files, arg_index)[0], files, engine)
 
         if rc != 0:
@@ -1652,19 +1784,19 @@ def _crispasr_batch(files: list, on_done=None, engine: str = ENGINE_PRIMARY,
         return results, None
 
 
-def _crispasr_one(file_path: Path, engine: str = ENGINE_PRIMARY):
+def _crispasr_one(file_path: Path, engine: str = ENGINE_PRIMARY, lid_off: bool = False):
     """
     单文件转写,用于批量失败后的精确定位。
     返回 (text, error);text 为 "" 表示合法的空转写。
 
     单文件模式下筛子同样工作,而且更省事:一次调用只有一个文件,判别行必然是它的,
     不需要 _lid_map 那套对号 —— 判到 AED 范围外就直接换兜底引擎再跑一次(递归一层,
-    兜底引擎不再筛)。
+    兜底引擎不再筛)。lid_off 的含义与批量版相同(帧级路由已经挑完了)。
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         base = os.path.join(tmpdir, "out")
         with staged_inputs([file_path]) as paths:
-            cmd = _base_cmd(engine) + ["-f", paths[file_path], "-of", base]
+            cmd = _base_cmd(engine, lid_off=lid_off) + ["-f", paths[file_path], "-of", base]
             rc, err = _run(cmd)
 
         if rc != 0:
@@ -1736,8 +1868,12 @@ def _gate_crispasr(extra):
     return proc.returncode, err
 
 
-def _gate_vad_segments(src, tmpdir: str):
+def _gate_vad_segments(src, tmpdir: str, vad_model: str = None):
     """silero VAD 导真语音段 → ([(起秒, 止秒)], None) 或 (None, 错误说明)。
+
+    vad_model 留空 = 用 GATE_VAD_MODEL(silero,语种闸门那一路)。帧级路由那一路传的是
+    CRISPASR_VAD_MODEL(FireRedVAD),理由是 silero v6.2.0 对唱歌素材判 0 段,而唱歌正是
+    最需要换引擎的那片 —— 两种 VAD 都是"导段表"这一个用法,共用这条调用。
 
     必须用 --vad-export-raw:不带 -raw 的那份导出来是 kind="chunks"(30 s 网格),
     不是语音段(10-09 校机实测)。段表里 start/end 是【采样点】、t0_cs/t1_cs 是【百分秒】,
@@ -1752,7 +1888,7 @@ def _gate_vad_segments(src, tmpdir: str):
     让下面那条已经写好的 0 段分支处理;两条分支的处置本来就相同(都是判原始文件)。
     """
     json_out = os.path.join(tmpdir, "vad.json")
-    rc, err = _gate_crispasr(["-f", src, "--vad", "-vm", GATE_VAD_MODEL,
+    rc, err = _gate_crispasr(["-f", src, "--vad", "-vm", vad_model or GATE_VAD_MODEL,
                               "--vad-export-raw", json_out,
                               "--strict-pipeline", "--require-vad"])
     if not os.path.isfile(json_out):
@@ -2074,6 +2210,382 @@ def gate_selfcheck(candidates: list) -> str:
             "\n  查 CRISPASR_EXE 能否 -dl、GATE_THREADS/GATE_TIMEOUT_SEC 是否过短")
 
 
+# ==================== 帧级语种路由(crispasr 主腿)====================
+#
+# 三段代码各管一种"谁来挑文件":语种闸门只在 onnx 腿跑,批内筛子只在 crispasr 腿跑,
+# 这一段是 crispasr 腿的【第三种】—— 判据来自本进程常驻的 FireRedLID ONNX 会话,看的是
+# 【整条】音频;而 crispasr 自己的前置判别器拿不到整文件(src/firered_lid.cpp:78-79 截到
+# 前 5 秒,再往上还有 src/crispasr_lid.cpp:284-286 的 15 秒总闸,CLI 没有窗口参数)。
+# 取哪一种由 LID_ROUTER 决定;判据名单三条路共用 _in_aed_range,没有另立一套。
+
+_frame_lid = None
+_frame_lid_fatal = ""
+_frame_lid_lock = threading.Lock()
+
+
+def frame_lid_session():
+    """建一次 FireRedLID ONNX 会话并常驻本进程。建不起来返回 None,原因记在 _frame_lid_fatal。
+
+    目录以本 CONFIG 为唯一权威:asr_chain 的 LID_ONNX_DIR / LID_DICT_DIR 是模块全局,先改它
+    再调 lid_init —— 与 chain_module() 处理 MODELS/VAD/PUNC 同一口径(cpu 分支踩过"只搬了
+    MODELS、别的环还指着旧目录"那一坑)。
+    权重是【建造产物】:两张图 + dict.txt/cmvn.ark 要用 onnx/optional-lid/lid_export.py 现导,
+    不在任何下载清单里,所以缺件是常态而不是意外 —— 调用方必须把降级写进日志,不能静默。
+    """
+    global _frame_lid, _frame_lid_fatal
+    with _frame_lid_lock:
+        if _frame_lid is None and not _frame_lid_fatal:
+            try:
+                chain = chain_module()
+                chain.LID_ONNX_DIR = Path(FRAME_LID_ONNX_DIR)
+                chain.LID_DICT_DIR = Path(FRAME_LID_DICT_DIR)
+                t0 = time.perf_counter()
+                _frame_lid = chain.lid_init("firered", FRAME_LID_THREADS)
+                logger.info(f"帧级 LID 会话就绪:{os.path.basename(FRAME_LID_ONNX_DIR)}"
+                            f" + {os.path.basename(FRAME_LID_DICT_DIR)}"
+                            f"({time.perf_counter() - t0:.1f}s,{FRAME_LID_THREADS} 线程,CPU)")
+            except Exception as e:
+                _frame_lid_fatal = f"{type(e).__name__}:{e}"
+                logger.critical(f"帧级 LID 会话起不来:{_frame_lid_fatal}")
+        return _frame_lid
+
+
+def _split_units(segs, cap_sec: float, min_sec: float):
+    """把 VAD 段切成至多 cap_sec 长的子段,短于 min_sec 的尾巴丢掉。
+
+    必须切:一条外语长音频常常只有一两个 VAD 段(10-09 校机 80.2 s 素材的段表就只有一条
+    0.03–79.55 s,记在 _speech_prefix 里),不切的话"范围外满 FRAME_LID_MIN_BAD_SEGS 段"
+    这条线永远够不到,整条外语文件照样被 AED 编造。子段互不重叠,计数不会被滑窗的重叠抬高。
+    """
+    units = []
+    for s, e in segs:
+        if cap_sec <= 0:
+            if e - s >= min_sec:
+                units.append((s, e))
+            continue
+        k = 0
+        while s + k * cap_sec < e:
+            a = s + k * cap_sec
+            b = min(e, a + cap_sec)
+            if b - a >= min_sec:
+                units.append((a, b))
+            k += 1
+    return units
+
+
+def _ffmpeg_decode(src):
+    """ffmpeg 解成 (链路 SR 的 mono float32, sr);解不了返回 None。
+
+    只服务 libsndfile 认不了的容器(m4a / mp4 / aac,见 _gate_load_audio)—— 这三种恰好是
+    小红书下载的主流封装,而 crispasr 内部那套 ffmpeg 是【静态链进二进制的库】,python 侧
+    拿不到,只能另外找可执行文件。找不到可执行文件时 frame_router_setup() 已经把整条路由
+    降级成批内筛子,所以走到这里的每一次都是"真解不出这一个文件",不是环境缺件。
+
+    -f f32le 从管道读出的字节流就是 np.float32 数组本身,量纲与 soundfile 读出来的同一个
+    (整数样本 /32768),因此链路 to_lid_scale 那一条乘回 int16 幅度照旧成立。
+    【不能】给 Popen 传 encoding= —— 那会同时把 stdout 变成文本流,communicate() 回来的是
+    str,np.frombuffer 当场报错;所以两条管道都按字节收,stderr 自己 decode。
+    -vn 丢视频流(mp4 带画面,不解码音频以外的东西);-nostdin 防它来抢驱动自己的键盘输入
+    (启动器那条 --start 靠按键停止)。超时沿用 GATE_TIMEOUT_SEC:闸门那条的口径是"本该
+    一两秒,超这个数就是环境出了问题",整条解码即便一小时素材也在几十秒量级,同样够。
+    """
+    if not FFMPEG_EXE:
+        return None
+    want_sr = chain_module().SR   # 采样率以链路那份为权威,不在这儿抄第二个字面值
+    cmd = [FFMPEG_EXE, "-hide_banner", "-loglevel", "error", "-nostdin",
+           "-i", str(src), "-vn", "-ac", "1", "-ar", str(want_sr),
+           "-f", "f32le", "-"]
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                creationflags=_POPEN_FLAGS)
+    except FileNotFoundError:
+        logger.warning(f"ffmpeg 找不到:{FFMPEG_EXE}")
+        return None
+    except Exception as e:
+        logger.warning(f"ffmpeg 起不来:{type(e).__name__}:{e}")
+        return None
+    bind_child(proc)
+    try:
+        out, errb = proc.communicate(timeout=GATE_TIMEOUT_SEC)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        logger.warning(f"ffmpeg 解码超时 {GATE_TIMEOUT_SEC:.0f}s:{os.path.basename(str(src))}")
+        return None
+    if proc.returncode != 0 or not out:
+        err = (errb or b"").decode("utf-8", "replace").strip()
+        logger.warning(f"ffmpeg 解不了 {os.path.basename(str(src))}"
+                       f"(退出码 {proc.returncode}):{err[:200]}")
+        return None
+    return np.frombuffer(out, dtype=np.float32), want_sr
+
+
+def _ffmpeg_probe():
+    """起批前验一次 ffmpeg【真能跑】,返回 (可用?, 给日志的一句话)。
+
+    只看文件在不在不够:PATH 里那条指着一个坏掉的构建时,每个 m4a 都会白跑一趟进程再
+    在日志里留一行"解不了" —— 那正是最难查的坏(看起来像素材的问题,其实是环境的)。
+    版本首行顺手带进日志,换了构建一眼能对上。
+    """
+    if not FFMPEG_EXE:
+        return False, "没找到 ffmpeg:PATH 里没有,ASR_FFMPEG 也没给"
+    try:
+        proc = subprocess.Popen([FFMPEG_EXE, "-hide_banner", "-version"],
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                encoding="utf-8", errors="replace",
+                                creationflags=_POPEN_FLAGS)
+    except Exception as e:
+        return False, f"{FFMPEG_EXE} 起不来:{type(e).__name__}:{e}"
+    bind_child(proc)
+    try:
+        out = (proc.communicate(timeout=30)[0] or "").strip().splitlines()
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return False, f"{FFMPEG_EXE} -version 30 s 没返回"
+    if proc.returncode != 0:
+        return False, f"{FFMPEG_EXE} -version 退出码 {proc.returncode}"
+    return True, (out[0] if out else FFMPEG_EXE)
+
+
+def _slice_note() -> str:
+    """给日志用的一句"编码怎么切的"。FRAME_LID_SLICE_SEC=0 时不能写成"≤0s"。"""
+    if FRAME_LID_SLICE_SEC > 0:
+        return f"每块≤{FRAME_LID_SLICE_SEC:g}s"
+    return "整条不切块"
+
+
+def _run_lid_blocks(chain, wav, sr, units, lid):
+    """按 FRAME_LID_SLICE_SEC 把子段打包成几段,每段各自"整条编码 + 滑窗解码"。
+    返回 (子段判定表, 窗表),时间都是【原始时间轴】上的绝对秒。
+
+    为什么要打包见 FRAME_LID_SLICE_SEC 那条:编码器的注意力随时长的平方涨,整条一次编码在
+    十分钟素材上会把夜间批次撑死。打包只沿着子段边界切(相邻子段之间那点空隙一起带上),
+    窗的时间戳减去段起点就是块内的相对时间,正好是 run_lid 期望的口径 —— 判据实现一个字没改,
+    只是把"一次"变成"若干次"。
+    """
+    cap = FRAME_LID_SLICE_SEC if FRAME_LID_SLICE_SEC > 0 else float("inf")
+    per, windows, blocks = [], [], 0
+    i = 0
+    while i < len(units):
+        a = units[i][0]
+        j, b = i, units[i][1]
+        while j + 1 < len(units) and units[j + 1][1] - a <= cap:
+            j += 1
+            b = units[j][1]
+        i0, i1 = max(0, int(a * sr)), min(int(wav.size), int(b * sr))
+        blk_per, _, blk_win = chain.run_lid(
+            np.ascontiguousarray(wav[i0:i1]), sr,
+            [(s - a, e - a) for s, e in units[i:j + 1]], lid,
+            win_s=FRAME_LID_WIN_SEC, hop_s=FRAME_LID_HOP_SEC, mode=FRAME_LID_MODE)
+        for u in blk_per:
+            per.append({**u, "start_s": round(u["start_s"] + a, 3),
+                        "end_s": round(u["end_s"] + a, 3)})
+        for w in (blk_win or []):
+            windows.append({**w, "start_s": round(w["start_s"] + a, 3),
+                            "end_s": round(w["end_s"] + a, 3)})
+        blocks += 1
+        i = j + 1
+    return per, windows, blocks
+
+
+def frame_route(src: str):
+    """整文件帧级判语种 → (要不要换引擎, 有票的子段数, 日志用说明)。
+
+    四步:FireRedVAD 导段 → 读成链路口径的音频(libsndfile 不认的容器换 ffmpeg)→
+    按 FRAME_LID_SLICE_SEC 打包整段编码 + 滑窗解码 + 按子段汇票(后两步直接复用
+    onnx/asr_chain.py 的 run_lid,与单文件跑 --lid 时同一条实现,不另写一份)。
+    判据只有一条:判到 AED 范围外的【子段数】够不够 FRAME_LID_MIN_BAD_SEGS。
+
+    votes=0 与 votes>0 但不路由是两件完全不同的事,日志必须分得开:
+      · votes>0 而范围外子段不够门限 —— 整条基本在 AED 能判的范围里,正常放行;
+      · votes=0 —— VAD 零段 / 两种解码器都读不了 / 子段全无窗覆盖 / 会话没起来。【看不见】不等于
+        【范围外】,按主链跑,与语种闸门那条同一口径 —— 否则路由自己一坏就把整棵树拖去
+        兜底引擎(那是比编造更难查的坏:一夜文件全换了引擎,而判据一条都没有)。
+        其中"两种解码器都读不了"那一条是这条路上唯一还剩的判别盲区:那种文件会照旧喂 AED、
+        且不挂筛子,所以 _ffmpeg_decode 为它单独打一行 warning,日志里留得下名字和退出码。
+    """
+    lid = frame_lid_session()
+    if lid is None:
+        return False, 0, f"帧级 LID 会话不可用({_frame_lid_fatal or '未建'}),不路由"
+    chain = chain_module()
+    t_all = time.perf_counter()
+    with tempfile.TemporaryDirectory(prefix="asrlid") as tmpdir:
+        segs, verr = _gate_vad_segments(src, tmpdir, vad_model=CRISPASR_VAD_MODEL)
+        if segs is None:
+            return False, 0, f"VAD 没出段表({verr}),不路由"
+        t_vad = time.perf_counter() - t_all
+        t_dec = 0.0
+        audio = _gate_load_audio(src)
+        if audio is None:
+            t0 = time.perf_counter()
+            audio = _ffmpeg_decode(src)
+            t_dec = time.perf_counter() - t0
+        if audio is None:
+            return False, 0, (f"libsndfile 与 ffmpeg 都解不了这条音频,整条判不了、"
+                              f"按主链跑且不挂筛子(vad {t_vad:.2f}s,"
+                              f"ffmpeg {t_dec:.2f}s)")
+        wav, sr = audio
+        dur = len(wav) / sr
+        units = _split_units(segs, FRAME_LID_UNIT_SEC, FRAME_LID_MIN_UNIT_SEC)
+        if not units:
+            return False, 0, (f"VAD {len(segs)} 段但切不出 ≥{FRAME_LID_MIN_UNIT_SEC:g}s 的子段"
+                              f"(音频 {dur:.0f}s),不路由 | vad {t_vad:.2f}s")
+        t0 = time.perf_counter()
+        per, windows, blocks = _run_lid_blocks(chain, wav, sr, units, lid)
+        t_lid = time.perf_counter() - t0
+        whole = lid.segment_vote(windows, 0.0, dur)
+    known = [u for u in per if u["lang"]]
+    bad = [u for u in known if not _in_aed_range(u["lang"])]
+    dist = {}
+    for u in known:
+        dist[u["lang"]] = dist.get(u["lang"], 0) + 1
+    head = " ".join(f"{k}×{v}" for k, v in
+                    sorted(dist.items(), key=lambda kv: (-kv[1], kv[0])))
+    why = (f"{dur:.0f}s 音频 / VAD {len(segs)} 段 → 子段 {len(per)}、窗 {len(windows)}"
+           f"({FRAME_LID_MODE} {FRAME_LID_WIN_SEC:g}s/{FRAME_LID_HOP_SEC:g}s,"
+           f"{_slice_note()},{blocks} 块)"
+           f" → 有票 {len(known)}、范围外 {len(bad)} [{head or '无票'}]"
+           f" 整条={whole['lang'] or '—'}"
+           f" | vad {t_vad:.2f}s" + (f" + ffmpeg {t_dec:.2f}s" if t_dec else "")
+           + f" + lid {t_lid:.2f}s")
+    if not known:
+        return False, 0, why + " —— 一个子段都没判出语种,不路由"
+    if len(bad) >= FRAME_LID_MIN_BAD_SEGS:
+        spans = ", ".join(f"{u['start_s']:.0f}–{u['end_s']:.0f}s {u['lang']}"
+                          for u in bad[:6])
+        tail = f" …共 {len(bad)} 段" if len(bad) > 6 else ""
+        return True, len(known), f"{why} | 范围外子段 {spans}{tail}"
+    return False, len(known), why
+
+
+def transcribe_batch_frame(files: list, on_done=None, engine: str = ENGINE_PRIMARY,
+                           flagged=None):
+    """crispasr 主链之前先按整文件路由一遍:判到范围外的【根本不喂 AED】,直接记账待兜底。
+
+    为什么不像筛子那样"照样喂、再把输出扣掉":筛子只能在 crispasr 进程里判,拦不住已经开跑
+    的转写;这里的判据在 crispasr 之外,先判完再决定,就白省一趟注定是编造内容的转写。
+    放行的那部分走 _crispasr_batch(lid_off=True) —— 主链那趟不挂前置判别器了,顺带省掉
+    crispasr_run.cpp:1029 那个每文件重装一遍 543 MB 的开销。
+
+    返回与 _crispasr_batch 同一份契约,process_batch 的形状不用改:
+      results 里 = AED 已产出;flagged 里 = 待兜底;两处都没有 = 未产出,逐文件重跑。
+    暂存区会套两层(这层给路由读音频、里面那层给 crispasr),靠 stage_paths 里那个全局自增
+    序号保证嵌套不重名。
+    """
+    if flagged is None:
+        flagged = set()
+    keep, routed = [], []
+    t_all = time.perf_counter()
+    with staged_inputs(files) as paths:
+        for i, f in enumerate(files):
+            if stop_requested():
+                logger.info(f"已请求停止,帧级路由在第 {i} 个文件处收工,"
+                            f"剩余 {len(files) - i} 个不路由、按主链跑")
+                keep.extend(files[i:])
+                break
+            hit, votes, why = frame_route(paths[f])
+            if hit and not USE_LID_FALLBACK:
+                logger.warning(f"帧级语种 [{f.name}] {why} —— 但 USE_LID_FALLBACK=False,"
+                               f"仅记录,仍按 {ENGINE_PRIMARY} 跑")
+                keep.append(f)
+            elif hit:
+                flagged.add(f)
+                routed.append(f)
+                logger.warning(f"帧级语种 [{f.name}] {why} —— 范围外子段已达 "
+                               f"{FRAME_LID_MIN_BAD_SEGS} 段,AED 不跑,"
+                               f"待 {ENGINE_FALLBACK} 兜底")
+            else:
+                keep.append(f)
+                logger.info(f"帧级语种 [{f.name}] {why}")
+    sec = time.perf_counter() - t_all
+    logger.info(f"帧级路由预筛:{len(routed)}/{len(files)} 个换 {ENGINE_FALLBACK},"
+                f"耗时 {sec:.1f}s({sec / max(1, len(files)):.1f} s/文件)")
+    if not keep:
+        return {}, None
+    return _crispasr_batch(keep, on_done=on_done, engine=engine,
+                           flagged=flagged, lid_off=True)
+
+
+def frame_router_setup() -> int:
+    """LID_ROUTER 的起批前自检。返回 0=按配置的走,1=降级成批内筛子,2=致命(配置本身不对)。
+
+    查的是"能不能建成会话",不是"文件名在不在":external data(那两个 .onnx.data 大文件)
+    缺件、ORT 版本不认这张图、kaldi_native_fbank 没装,只有真建一次才看得见。
+    """
+    if LID_ROUTER not in ("frame", "sieve", "off"):
+        logger.critical(f'LID_ROUTER={LID_ROUTER!r} 只认 "frame" | "sieve" | "off"'
+                        f"(环境变量 ASR_LID_ROUTER)")
+        return 2
+    if LID_ROUTER == "sieve" or not _frame_router_wanted():
+        return 0
+    if LID_ROUTER == "off":
+        logger.info("语种路由:off —— 不挑文件,AED 一条道跑到黑"
+                    "(前置判别器仍挂在命令里,但结论不参与处置)")
+        return 0
+    miss = [p for p in (os.path.join(FRAME_LID_ONNX_DIR, "lid_encoder.onnx"),
+                        os.path.join(FRAME_LID_ONNX_DIR, "lid_decoder_step.onnx"),
+                        os.path.join(FRAME_LID_DICT_DIR, "dict.txt"),
+                        os.path.join(FRAME_LID_DICT_DIR, "cmvn.ark"))
+            if not os.path.isfile(p)]
+    if miss:
+        logger.critical("帧级路由缺权重:\n  " + "\n  ".join(miss) +
+                        "\n  这四件是建造产物,补法:"
+                        "onnx/optional-lid/lid_export.py --src <FireRedASR2S 仓库根>"
+                        " --models <模型根> --wav <一段参考音频>"
+                        "(要 torch + 官方 model.pth.tar);"
+                        "已有整套的机器用 FIREDASR_LID_ONNX_DIR / FIREDASR_LID_DICT_DIR 指过去")
+        return 1
+    if CRISPASR_VAD_MODEL and not os.path.isfile(CRISPASR_VAD_MODEL):
+        logger.critical(f"帧级路由的段表来源不存在:{CRISPASR_VAD_MODEL}\n"
+                        f"  路由靠 FireRedVAD 导子段(silero 对唱歌素材判 0 段),"
+                        f"没有它就一个子段都切不出来")
+        return 1
+    # 为什么 ffmpeg 缺了是【整条路由降级】而不是"这三种容器跳过":能读的走帧级、读不了的
+    # 退回筛子,要在同一批里开两个 crispasr 进程(前置判别器挂在命令行上,不是按文件给的);
+    # 而"这台机器有没有能用的 ffmpeg"是环境属性,不是单个文件的属性 —— 起批前一次判清、
+    # 整批只走一条路,日志只有一种形状。降级成筛子=退回改动前的行为,不是雪上加霜。
+    ok, ff = _ffmpeg_probe()
+    if not ok:
+        logger.critical(f"帧级路由解不了 m4a / mp4 / aac:{ff}\n"
+                        f"  libsndfile 不认这三种容器(见 _gate_load_audio),而它们在 EXTENSIONS 里"
+                        f" —— 小红书下载的主流封装恰好全是这一类。没有能用的 ffmpeg,这批里"
+                        f"凡是这三种封装的文件一个都不判,所以整条路由降级成批内筛子,"
+                        f"而不是让这片文件连筛子都没有。装一个 ffmpeg 并让它进 PATH"
+                        f"(或 ASR_FFMPEG 指到 ffmpeg.exe)再重启本驱动")
+        return 1
+    if frame_lid_session() is None:
+        return 1
+    logger.info(f"语种路由:frame —— 整文件帧级判别"
+                f"({FRAME_LID_MODE} {FRAME_LID_WIN_SEC:g}s/{FRAME_LID_HOP_SEC:g}s 窗,"
+                f"子段 ≤{FRAME_LID_UNIT_SEC:g}s,{_slice_note()},"
+                f"范围外满 {FRAME_LID_MIN_BAD_SEGS} 段才换 "
+                f"{ENGINE_FALLBACK};主链那趟 --lid-backend off;解容器用 {ff})")
+    return 0
+
+
+def frame_selfcheck(candidates: list) -> str:
+    """拿前几个待处理文件实跑一次路由,确认【判得出语种】。返回 '' = 通过。
+
+    这层为什么不能省:路由坏了不产生任何错误 —— crispasr 照常返回 0、AED 照常出字,只是
+    每个文件都"没证据 ⇒ 不路由",于是整批外语素材被编成汉字并正常落盘,下游看不出区别
+    (与 --no-prints 把筛子搞瞎那个坑同源)。
+    但【不判致命】:唱歌素材 VAD 判 0 段是这类语料的已知合法形态(依据见 CONFIG · VAD 那组
+    数字),头几个文件恰好全是这种素材不等于路由坏了,拿它停机是把正常素材当故障。
+    """
+    tried = []
+    for f in candidates:
+        with staged_inputs([f]) as paths:
+            hit, votes, why = frame_route(paths[f])
+        tried.append(f"{f.name}:{why}")
+        if votes:
+            logger.info(f"帧级路由自检通过:{f.name} → {why}")
+            return ""
+    return ("帧级路由跑不出任何语种结论,已试 " + str(len(tried)) + " 个文件:\n  "
+            + "\n  ".join(tried) +
+            "\n  这不一定坏(唱歌素材 VAD 判 0 段是已知形态),但继续跑等于本批【没有语种路由】,"
+            "范围外的语种会被 AED 编造成汉字。"
+            "\n  查 CRISPASR_VAD_MODEL 能否导段、FIREDASR_LID_ONNX_DIR 那两张图是否完整")
+
+
 def _onnx_one(file_path: Path, staged: str = None):
     """主链跑一个文件,返回 (文本, 错误)。与 _crispasr_one 同一份契约。
 
@@ -2154,10 +2666,18 @@ def transcribe_batch_onnx(files: list, on_done=None, flagged=None):
 
 def transcribe_batch(files: list, on_done=None, engine: str = ENGINE_PRIMARY,
                      flagged=None):
-    """按 PRIMARY_LEG 分发到 ONNX 主链或 crispasr。兜底引擎永远走 crispasr。"""
+    """按 PRIMARY_LEG 与 LID_ROUTER 分发。兜底引擎永远走 crispasr,且永远不再筛自己。
+
+    crispasr 腿 + LID_ROUTER="frame" 时先在 AED 之外按整文件挑一遍(transcribe_batch_frame),
+    其余情形与 10-14 那版逐字相同。
+    """
     if PRIMARY_LEG == "onnx" and engine == ENGINE_PRIMARY:
         return transcribe_batch_onnx(files, on_done=on_done, flagged=flagged)
-    return _crispasr_batch(files, on_done=on_done, engine=engine, flagged=flagged)
+    if engine == ENGINE_PRIMARY and _router() == "frame":
+        return transcribe_batch_frame(files, on_done=on_done, engine=engine,
+                                      flagged=flagged)
+    return _crispasr_batch(files, on_done=on_done, engine=engine, flagged=flagged,
+                           lid_off=_sieve_off_for_primary(engine))
 
 
 def transcribe_one(file_path: Path, engine: str = ENGINE_PRIMARY):
@@ -2177,7 +2697,23 @@ def transcribe_one(file_path: Path, engine: str = ENGINE_PRIMARY):
                 return _onnx_one(file_path, staged=src)
             logger.info(f"主链 [{file_path.name}] 换 crispasr 解容器(链路读不了这个格式)")
             return _crispasr_one(file_path, ENGINE_PRIMARY)
-    return _crispasr_one(file_path, engine)
+    if engine == ENGINE_PRIMARY and _router() == "frame":
+        # 逐文件那条路也必须过同一个路由,否则"批量跑不动→改逐文件"这个降级会把
+        # 整文件判据悄悄换成前 5 秒判据(甚至换成没有判据)。
+        with staged_inputs([file_path]) as paths:
+            hit, votes, why = frame_route(paths[file_path])
+        if hit:
+            if USE_LID_FALLBACK:
+                logger.warning(f"帧级语种 [{file_path.name}] {why} —— 范围外子段已达 "
+                               f"{FRAME_LID_MIN_BAD_SEGS} 段,改用 {ENGINE_FALLBACK}")
+                return _crispasr_one(file_path, ENGINE_FALLBACK)
+            logger.warning(f"帧级语种 [{file_path.name}] {why}"
+                           f" —— 但 USE_LID_FALLBACK=False,仅记录")
+        else:
+            logger.info(f"帧级语种 [{file_path.name}] {why}")
+        return _crispasr_one(file_path, engine, lid_off=True)
+    return _crispasr_one(file_path, engine,
+                         lid_off=_sieve_off_for_primary(engine))
 
 
 # ==================== 主处理 ====================
@@ -2373,13 +2909,47 @@ def main_loop() -> int:
     else:
         logger.info(f"策略:只用 {ENGINE_PRIMARY},判到范围外仅在日志里报一句")
 
+    rc = frame_router_setup()
+    if rc == 2:
+        return rc
+    if rc == 1:
+        logger.warning("帧级路由不可用,本批【降级成批内筛子】—— 挑文件回到"
+                       "【每个文件只看前 5 秒】的老口径(片头是音乐就必然判错)。"
+                       "上面那条 critical 写了缺什么;不想降级就显式给"
+                       " ASR_LID_ROUTER=sieve 或 off,或照那条提示把权重补齐")
+
     if (CRISPASR_VAD_MODEL and CRISPASR_VAD_MODEL != "webrtc"
             and not os.path.isfile(CRISPASR_VAD_MODEL)):
         # 不致命:crispasr 会退回固定分块继续跑,但转写会在语句中途被切断
         logger.warning(f"VAD 模型不存在:{CRISPASR_VAD_MODEL}(VAD 将失效)")
 
     if CRISPASR_LANGUAGE == "auto":
-        if _lid_is_off():
+        if _router() == "frame":
+            # 帧级路由不依赖批内筛子,但【兜底那趟】依赖:qwen3 是真吃 -l 的
+            # (crispasr_backend_qwen3.cpp:180-184),--lid-model 缺失会让它每个文件联网
+            # 超时约 30 s 后按 crispasr_run.cpp:1012 强制成 en,而强制错语种是本语料实测
+            # 最差的一档(见 CONFIG · 引擎"换引擎备查"那段)。所以这里照旧判致命。
+            if not (CRISPASR_LID_MODEL and os.path.isfile(CRISPASR_LID_MODEL)):
+                logger.critical(
+                    f'帧级路由要用 ONNX 判别器挑文件,但 {ENGINE_FALLBACK} 兜底那趟仍要'
+                    f'前置判别器(qwen3 真吃 -l),而它的模型文件不存在:'
+                    f'{CRISPASR_LID_MODEL or "(未配置)"}\n'
+                    f'  要么填对顶部资源块里的 CRISPASR_LID_MODEL,'
+                    f'  要么把 CRISPASR_LID_BACKEND 改回 "off"(兜底趟就没有语种依据,'
+                    f'  语种由 qwen3 自己定),要么把 ASR_LID_ROUTER 改成 sieve/off')
+                return 2
+            logger.info(f"语种:-l auto + 帧级路由(整文件)挑文件 —— AED 那趟挂"
+                        f" --lid-backend off,批内筛子的前 5 秒结论不参与处置;"
+                        f"{ENGINE_FALLBACK} 那趟仍挂 {CRISPASR_LID_BACKEND}"
+                        f" ({os.path.basename(CRISPASR_LID_MODEL)})")
+        elif _router() == "off":
+            logger.info("语种:-l auto + 路由 off —— 主链那趟【不挂】前置判别器,"
+                        f"没有文件会被挑给 {ENGINE_FALLBACK},AED 内置判别一条道跑到黑"
+                        f"(可判范围 {'/'.join(AED_COVERS)})")
+            if USE_LID_FALLBACK:
+                logger.warning("USE_LID_FALLBACK=True 但路由 off:没有文件会被挑走,"
+                               f"{ENGINE_FALLBACK} 那趟永远不会跑(要它就让 ASR_LID_ROUTER=frame)")
+        elif _lid_is_off():
             logger.info("语种:-l auto,只用 AED 内置语种判别,不挂前置判别器"
                         f"(可判范围 {'/'.join(AED_COVERS)})—— 此时【兜底不会触发】")
             if USE_LID_FALLBACK:
@@ -2427,6 +2997,11 @@ def main_loop() -> int:
         if why:
             logger.critical(why)
             return 2
+    if _router() == "frame":
+        head = [f for fl in groups.values() for f in fl][:GATE_SELFCHECK_FILES]
+        why = frame_selfcheck(head)
+        if why:
+            logger.warning(why)
     for group_key, file_list in groups.items():
         process_group(group_key, file_list, rules, stats)
         if stats.stopped:
