@@ -814,17 +814,25 @@ ONNX_PUNC_FILE = os.environ.get("FIREDASR_ONNX_PUNC_FILE", "")   # 空 = 先 pun
 # 整条音频(process_windows 的 mode="slice",窗=编码器输出的时间切片),所以"整个文件到底是
 # AED 能判的还是不能判的"这个问题第一次拿到整文件的答案。
 #
-# 为什么要"占满三段"才换:单点误判太便宜。判别器给的 p= 恒 1.0(src/firered_lid.cpp:90
-# "beam search returns argmax, no explicit probability"),结构上没有置信度闸门可用;窗级投票
-# 一次只看 3 s,一段环境音或一句英文人名就可能翻出一个范围外标签。按 FRAME_LID_MIN_BAD_SEGS=3
-# 计段 ⇒ 换引擎要三段独立证据,而假阳性的代价本来只有"白跑一遍 qwen3"(0.19 RTF,比 AED 快 5 倍)。
-# 假阴性仍然在:判成 zh 的外语文件照样被 AED 用汉字编造并正常落盘,这一层没有任何东西收得住 ——
+# 为什么要三条一起(证据数、占比、绝对量),而不是"数到三段":窗级投票一次只看 3 s,
+# 一段环境音或一句英文人名就可能翻出一个范围外标签。能当闸门的只有计数 —— crispasr 那条
+# -dl 的 p= 恒写死 1.0(src/firered_lid.cpp:90 "beam search returns argmax, no explicit
+# probability"),帧级这条的 segment_vote 虽然给 score(onnx/optional-lid/lid_onnx.py:314-326,
+# 量纲是"重叠时长×逐 token 置信度"的加权和,随手长涨、不是概率),没有任何语料能定它的阈值,
+# 所以拿它当闸门等于拍一个数。
+# 而"范围外子段数 ≥ 3"这一条【只看分子】,两头都错:一条 12 s 的日语独白切不出 3 个子段
+# (6 s 一刀,只有 2 段),永远够不到那条线 —— 而它正是要抓的那类文件;反过来一条 5 分钟的
+# 中文视频,片头 3 个子段被判成外语(18 s / 300 s = 6%)就把整条换引擎。10-17 换成
+# 占比满 1/4、绝对量满 min(15 s, 语音时长的一半)、且至少 2 个子段(除非有票的子段全在范围外)。
+# 假阳性确实便宜(兜底那趟 0.19 RTF,比 AED 快 5 倍),所以三条的门槛都定得不高 ——
+# 但假阴性仍然在:判成 zh 的外语文件照样被 AED 用汉字编造并正常落盘,这一层没有任何东西收得住 ——
 # 帧级改的是【看到多少音频】,不是【判得准不准】。
 #
-# 计数的"段"= VAD 段,但长段先按 FRAME_LID_UNIT_SEC 切成子段。必须切:一条十分钟的日语独白在 VAD
-# 下常常就一两段(10-09 校机实测 80.2 s 素材的段表只有一条 0.03–79.55 s,记在 _speech_prefix 里),
-# 不切的话"≥3 段"永远达不成,整条外语文件照样被编造。切完之后"三段"= 三段互不重叠的子段,
-# 合计至少 18 s 的范围外证据,误判闸门照样管用。
+# 计量的"段"= VAD 段按 FRAME_LID_UNIT_SEC 切开的子段,占比按【语音时长】算而不是按文件时长算:
+# 一条十分钟的日语独白在 VAD 下常常就一两段(10-09 校机实测 80.2 s 素材的段表只有一条
+# 0.03–79.55 s,记在 _speech_prefix 里),不切子段的话短素材会被一整段吞掉、
+# 长素材的局部误判会被当成整条的证据;而不扣 VAD 空段的话,"半句话＋两分钟静音"的素材
+# 会把占比的分母撑虚,谁也都过不了 1/4。
 #
 # VAD 用的是 CRISPASR_VAD_MODEL(FireRedVAD),不是语种闸门那份 silero:silero v6.2.0 对唱歌素材
 # 判 0 段(依据见 CONFIG · VAD 那组数字),而唱歌正是最需要换引擎的那片;FireRedVAD 与主引擎同源,
@@ -861,7 +869,9 @@ ONNX_PUNC_FILE = os.environ.get("FIREDASR_ONNX_PUNC_FILE", "")   # 空 = 先 pun
 # 只在 PRIMARY_LEG="crispasr" 时生效。onnx 腿的语种闸门(silero + whisper-tiny -dl)原样不动,
 # 它本来就只在 onnx 腿跑;把闸门也换成帧级是后续的事,现在改它等于动一条已经跑过生产的路由。
 LID_ROUTER = (os.environ.get("ASR_LID_ROUTER") or "frame").strip().lower()
-FRAME_LID_MIN_BAD_SEGS = int(os.environ.get("FIREDASR_LID_MIN_BAD_SEGS") or 3)
+FRAME_LID_BAD_FRAC = float(os.environ.get("FIREDASR_LID_BAD_FRAC") or 0.25)
+FRAME_LID_BAD_HALF = float(os.environ.get("FIREDASR_LID_BAD_HALF") or 0.5)
+FRAME_LID_BAD_ABS_SEC = float(os.environ.get("FIREDASR_LID_BAD_ABS_SEC") or 15.0)
 FRAME_LID_UNIT_SEC = float(os.environ.get("FIREDASR_LID_UNIT_SEC") or 6.0)
 FRAME_LID_MIN_UNIT_SEC = 1.0   # 短于此的子段丢掉:凑不满一个窗,只会白占计数不产证据
 FRAME_LID_WIN_SEC  = float(os.environ.get("FIREDASR_LID_WIN_SEC") or 3.0)
@@ -2280,8 +2290,10 @@ def _split_units(segs, cap_sec: float, min_sec: float):
     """把 VAD 段切成至多 cap_sec 长的子段,短于 min_sec 的尾巴丢掉。
 
     必须切:一条外语长音频常常只有一两个 VAD 段(10-09 校机 80.2 s 素材的段表就只有一条
-    0.03–79.55 s,记在 _speech_prefix 里),不切的话"范围外满 FRAME_LID_MIN_BAD_SEGS 段"
-    这条线永远够不到,整条外语文件照样被 AED 编造。子段互不重叠,计数不会被滑窗的重叠抬高。
+    0.03–79.55 s,记在 _speech_prefix 里)。切完之后每个子段各投一票、各贡献自己那 ≤6 s 的
+    时长,于是一条被判成外语的 80 s 长段不会【一票顶掉整条】(占比会瞬间 100%,而它可能只有
+    头 6 s 真是外语),而一条 12 s 的外语素材也能攒出两个独立子段。子段互不重叠,
+    时长不会被滑窗的重叠抬高。
     """
     units = []
     for s, e in segs:
@@ -2419,7 +2431,8 @@ def frame_route(src: str):
     四步:FireRedVAD 导段 → 读成链路口径的音频(libsndfile 不认的容器换 ffmpeg)→
     按 FRAME_LID_SLICE_SEC 打包整段编码 + 滑窗解码 + 按子段汇票(后两步直接复用
     onnx/asr_chain.py 的 run_lid,与单文件跑 --lid 时同一条实现,不另写一份)。
-    判据只有一条:判到 AED 范围外的【子段数】够不够 FRAME_LID_MIN_BAD_SEGS。
+    判据是三条一起:范围外的【子段数】≥2(或有票的子段全在范围外)、【时长】≥min(15 s, 语音时长的一半)、
+    【占比】≥1/4。为什么不再只数段数,见 CONFIG · 帧级语种路由(LID_ROUTER)那一段。
 
     votes=0 与 votes>0 但不路由是两件完全不同的事,日志必须分得开:
       · votes>0 而范围外子段不够门限 —— 整条基本在 AED 能判的范围里,正常放行;
@@ -2461,21 +2474,30 @@ def frame_route(src: str):
         whole = lid.segment_vote(windows, 0.0, dur)
     known = [u for u in per if u["lang"]]
     bad = [u for u in known if not _in_aed_range(u["lang"])]
+    known_sec = sum(u["end_s"] - u["start_s"] for u in known)
+    bad_sec = sum(u["end_s"] - u["start_s"] for u in bad)
     dist = {}
     for u in known:
         dist[u["lang"]] = dist.get(u["lang"], 0) + 1
     head = " ".join(f"{k}×{v}" for k, v in
                     sorted(dist.items(), key=lambda kv: (-kv[1], kv[0])))
+    frac = bad_sec / known_sec if known_sec else 0.0
+    abs_need = min(FRAME_LID_BAD_ABS_SEC, FRAME_LID_BAD_HALF * known_sec)
+    need = (f"需 ≥{FRAME_LID_BAD_FRAC:g} 且 ≥{abs_need:.0f}s" if known else "无票")
     why = (f"{dur:.0f}s 音频 / VAD {len(segs)} 段 → 子段 {len(per)}、窗 {len(windows)}"
            f"({FRAME_LID_MODE} {FRAME_LID_WIN_SEC:g}s/{FRAME_LID_HOP_SEC:g}s,"
            f"{_slice_note()},{blocks} 块)"
-           f" → 有票 {len(known)}、范围外 {len(bad)} [{head or '无票'}]"
+           f" → 有票 {len(known)}/{known_sec:.0f}s、范围外 {len(bad)}/{bad_sec:.0f}s"
+           f"(占 {frac:.2f},{need}) [{head or '无票'}]"
            f" 整条={whole['lang'] or '—'}"
            f" | vad {t_vad:.2f}s" + (f" + ffmpeg {t_dec:.2f}s" if t_dec else "")
            + f" + lid {t_lid:.2f}s")
     if not known:
         return False, 0, why + " —— 一个子段都没判出语种,不路由"
-    if len(bad) >= FRAME_LID_MIN_BAD_SEGS:
+    # 三条一起过(证据数 / 绝对量 / 占比),为什么不再是"数到三段"见 CONFIG · 帧级语种路由。
+    # 绝对量对短素材让路(min 的右半边),占比这一半边专治"长文件里一小段外语"。
+    enough_units = len(bad) >= 2 or len(bad) == len(known)
+    if enough_units and bad_sec >= abs_need and frac >= FRAME_LID_BAD_FRAC:
         spans = ", ".join(f"{u['start_s']:.0f}–{u['end_s']:.0f}s {u['lang']}"
                           for u in bad[:6])
         tail = f" …共 {len(bad)} 段" if len(bad) > 6 else ""
@@ -2516,9 +2538,8 @@ def transcribe_batch_frame(files: list, on_done=None, engine: str = ENGINE_PRIMA
             elif hit:
                 flagged.add(f)
                 routed.append(f)
-                logger.warning(f"帧级语种 [{f.name}] {why} —— 范围外子段已达 "
-                               f"{FRAME_LID_MIN_BAD_SEGS} 段,AED 不跑,"
-                               f"待 {ENGINE_FALLBACK} 兜底")
+                logger.warning(f"帧级语种 [{f.name}] {why} —— 范围外时长与占比都已达阈值,"
+                               f"AED 不跑,待 {ENGINE_FALLBACK} 兜底")
             else:
                 keep.append(f)
                 logger.info(f"帧级语种 [{f.name}] {why}")
@@ -2583,7 +2604,8 @@ def frame_router_setup() -> int:
     logger.info(f"语种路由:frame —— 整文件帧级判别"
                 f"({FRAME_LID_MODE} {FRAME_LID_WIN_SEC:g}s/{FRAME_LID_HOP_SEC:g}s 窗,"
                 f"子段 ≤{FRAME_LID_UNIT_SEC:g}s,{_slice_note()},"
-                f"范围外满 {FRAME_LID_MIN_BAD_SEGS} 段才换 "
+                f"范围外满 {FRAME_LID_BAD_ABS_SEC:g}s(短素材减半)且占语音 "
+                f"{FRAME_LID_BAD_FRAC:g} 才换 "
                 f"{ENGINE_FALLBACK};主链那趟 --lid-backend off;解容器用 {ff})")
     return 0
 
@@ -2730,8 +2752,8 @@ def transcribe_one(file_path: Path, engine: str = ENGINE_PRIMARY):
             hit, votes, why = frame_route(paths[file_path])
         if hit:
             if USE_LID_FALLBACK:
-                logger.warning(f"帧级语种 [{file_path.name}] {why} —— 范围外子段已达 "
-                               f"{FRAME_LID_MIN_BAD_SEGS} 段,改用 {ENGINE_FALLBACK}")
+                logger.warning(f"帧级语种 [{file_path.name}] {why} —— 范围外时长与占比都已达阈值,"
+                               f"改用 {ENGINE_FALLBACK}")
                 return _crispasr_one(file_path, ENGINE_FALLBACK)
             logger.warning(f"帧级语种 [{file_path.name}] {why}"
                            f" —— 但 USE_LID_FALLBACK=False,仅记录")
