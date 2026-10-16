@@ -201,7 +201,7 @@ I/O 契约（与 `CrispASR-Qwen/`、`cpu` 分支那两份逐条相同）：
 | `CRISPASR_LANGUAGE` | `"auto"` | AED 内置语种判别只覆盖 中文(+约20种汉语方言)/英语/粤语，范围外**不是差一点，是拿汉字编造**，而且 `-l` 改不了它 |
 | `CRISPASR_LID_BACKEND` | `"firered"` | 前置筛子（10-14 从 `"whisper"` 换过来，配合 `CRISPASR_LID_MODEL` 那件 firered-lid-f16）。**只在默认腿 `crispasr` 下拼进转写命令**，每文件判一次；`onnx` 档不用它，那条腿的语种由下面 `GATE_*` 那三步独立判。四条性质与换回 whisper 的方法见第 5.2 节；上游另把 `--lid-backend ecapa` 标了 recommended，10-17 在校机评估过、**不换**（§7.7） |
 | `BATCH_SIZE` | `28` | 一次调用喂多个 `-f`，模型/VAD 只加载一次 |
-| `LID_ROUTER` | `"frame"` | 10-16 加的那层：换不换引擎由**整文件**的帧级判别决定，不是由前几秒决定。`frame` = 每条音频完整过一遍 FireRedLID ONNX（`onnx/optional-lid/lid_onnx.py`，CPU），按 VAD 段计票；`sieve` = 10-14 那种批内前置筛子（每文件只看前 5 s）；`off` = 两层都不挂，整批直接喂 AED。之所以非 `frame` 不可：`src/crispasr_lid.cpp:284` 把外部判别器的输入截到原始音频前 15 s，`src/firered_lid.cpp:78` 在里面**再截到 5 s**，而 crispasr 的 CLI **没有任何窗口旋钮**（只有 `--lid-backend` / `--lid-model` / `--lid-on-transcript`，`examples/cli/cli.cpp:496-500`）—— 也就是说"整个文件都在 FireRed 支持/不支持之列"这句话，crispasr 自己给不出来。判据与四条降级见 §7 |
+| `LID_ROUTER` | `"frame"` | 10-16 加的那层：换不换引擎由**整文件**的帧级判别决定，不是由前几秒决定。`frame` = 每条音频完整过一遍 FireRedLID ONNX（`onnx/optional-lid/lid_onnx.py`，CPU），按 VAD 段计票；`sieve` = 10-14 那种批内前置筛子（每文件只看前 5 s）；`off` = 两层都不挂，整批直接喂 AED。之所以非 `frame` 不可：`src/crispasr_lid.cpp:284` 把外部判别器的输入截到原始音频前 15 s，`src/firered_lid.cpp:78` 在里面**再截到 5 s**，而 crispasr 的 CLI **没有任何窗口旋钮**（只有 `--lid-backend` / `--lid-model` / `--lid-on-transcript`，`examples/cli/cli.cpp:496-500`）—— 也就是说"整个文件都在 FireRed 支持/不支持之列"这句话，crispasr 自己给不出来。判据与四条降级见 §7；10-17 又核到外层那一刀在 `switch` **之前**、四个后端（含 `silero`）全在刀下，`CRISPASR_SILERO_LID_MAX_S`（默认 30）在这条路径上吃不到 ⇒ **没有"换个后端就能看更长"这条路**（§7.1） |
 | `FRAME_LID_BAD_FRAC` / `FRAME_LID_BAD_ABS_SEC` / `FRAME_LID_BAD_HALF` / `FRAME_LID_UNIT_SEC` / `FRAME_LID_MIN_UNIT_SEC` | 0.25 / 15.0 / 0.5 / 6.0 / 1.0 | 换引擎的三条线：**占比**（范围外秒数 ÷ 有票语音时长 ≥1/4）、**绝对量**（≥`min(15 s, 语音时长的一半)`）、**独立证据数**（≥2 个子段，除非有票的子段全在范围外）。10-17 之前只有"数到三段"一条（`FRAME_LID_MIN_BAD_SEGS=3`，她原判据），只看分子：一条 12 s 的日语独白按 6 s 切只有 2 个子段，永远够不到，而它正是要抓的那类；反过来 5 分钟中文视频片头 3 个子段被判外语（18 s / 300 s = 6%）就把整条换引擎。**分母用语音时长不用文件时长**：不扣 VAD 空段的话"半句话＋两分钟静音"会把分母撑虚，谁也都过不了 1/4。**计数单位是子段不是 VAD 段**：一条日语独白在 VAD 下常常只有一两段（10-09 校机实测 80.2 s 素材的段表只有一条 0.03–79.55 s），不切子段的话一段环境音就能顶掉整条；短于 1 s 的尾巴凑不满一个 3 s 窗、只白占计数，丢掉。为什么三条都是计数而没有一条是置信度：crispasr 那条 `-dl` 的 confidence **写死 1.0**（`src/firered_lid.cpp:90`），帧级这条的 `segment_vote` 虽然给一个 `score`（`lid_onnx.py:314-326`，"重叠时长×逐 token 置信度"的加权和，随手长涨、不是概率），但没有任何语料能定它的阈值 —— 拿它当闸门等于再拍一个数。三个数值 10-17 在校机沙箱扫过 6×4 档（B 级素材：合成网格 29 件，日语只有歌、韩语是 TTS）：**两个极端在整个扫描区间一次都没翻面**（整条外语 5/5 恒路由、纯中文＋中文接中文＋英语插入 0/4 恒不路由），会被阈值动的只有"中文底料＋外语插入"那 20 件 —— 出厂档路由 4 件，`frac` 降到 0.10 就 14 件，而代价那一侧（中文被换到 qwen3 之后质量退不退）一点都没量到 ⇒ **本轮不动出厂数**，逐档件数与翻面清单在 §7.5 |
 | `FRAME_LID_WIN_SEC` / `FRAME_LID_HOP_SEC` / `FRAME_LID_MODE` | 3.0 / 1.5 / `"slice"` | 滑窗逐窗解码，与 `onnx` 腿那条 `run_lid` 同一套参数、同一份代码（驱动直接调 `chain.run_lid`，不复制实现）。`slice` 是"一次编码、逐窗解码" |
 | `FRAME_LID_SLICE_SEC` | 60.0 | 一次编码最多覆盖多少秒。编码器是 Conformer 全自注意力，分数矩阵随时长**平方**涨：十分钟素材 T=15000 帧（25 帧/s），单层 4 头就要 4×15000²×4 B ≈ 3.6 GB，夜间无人值守会被它撑死。把相邻子段打包成 ≤60 s 的块、每块各自编码，总代价 ∝ ΣTᵢ² 比整条**更省**；代价只有块边界上的窗少看几十秒上下文，而 3 s 窗判语种用不着长上下文。`0` = 不切，整条一次编码 |
@@ -744,6 +744,16 @@ import 干净、`CUDAExecutionProvider` 在列、3.1 GB 的 f32 编码器会话�
   注释自己写了理由："The encoder is O(T²) per layer, so halving T gives 4x speedup"；
 * `examples/cli/cli.cpp:496-500` —— CLI 只有 `--lid-backend` / `--lid-model` /
   `--lid-on-transcript` 三个语种旋钮，**没有任何窗口/时长参数**。
+* 10-17 再核深一层，**这一刀也不是"只截 firered、别的后端有豁免"**：`src/crispasr_lid.cpp:281-293`
+  的 `kLidMaxSamples` 在 `switch (opts.method)` **之前**，`whisper` / `silero` / `firered` / `ecapa`
+  四个后端全在刀下。`src/silero_lid.cpp:1224-1227` 自己那道 30 秒上限（`CRISPASR_SILERO_LID_MAX_S`，
+  默认 30、写 0 = 不限）因此在 CLI 这条路径上**永远吃不到** —— 全仓只有一处调 `silero_lid_detect`
+  （`src/crispasr_lid.cpp:174`；grep 覆盖 `src/`+`examples/`+`include/` 与 py/js/cs 绑定，
+  10-17 在本地检出 `v0.8.37-5-g6b78932` 上查），传进去的样本已经被截过。`src/ecapa_lid.cpp:371-375`
+  的注释是上游自证："The caller (crispasr_detect_language) already truncates to 15 s."
+  ⇒ 上游 README 那句"silero 分析前 30 秒（`CRISPASR_SILERO_LID_MAX_S` overrides）"（本地检出
+  `README.md:607`，10-17 直读）**从 `--lid-backend silero` 走不到**，实际最多 15 秒。
+  这一条把"换个后端就能看更长"这条退门关死：**在 crispasr 里面没有比 15 秒更长的窗口。**
 
 所以"整个文件都在 FireRed 支持之列"这句话，crispasr 自己给不出来；能给的只有那条
 `onnx/optional-lid/lid_onnx.py`（她自己导的 FireRedLID ONNX），它按滑窗逐窗解码、不截断。
