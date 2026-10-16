@@ -2,26 +2,31 @@
  "engine": "CrispASR / firered-asr（CUDA）+ FireRedASR2S ONNX 全链路",
  "driver": "Flid-Cg-firered-Cg-qwen.py",
  "branch": "gpu",
- "note": "主引擎 FireRedASR2-AED + 兜底 qwen3 的双引擎驱动。出厂默认 PRIMARY_LEG=\"crispasr\"：主力那一路就是 crispasr.exe 的 firered-asr 后端。10-16 起换引擎的判据默认由【帧级语种路由】给出（LID_ROUTER=\"frame\"，README §7）：整条音频在 crispasr 之外过一遍 FireRedLID 的 ONNX（下面 frame_lid_build 那一组），按 VAD 子段计票，判到 AED 覆盖范围外的语种满 3 段才把那个文件扣下换 qwen3（范围外的语言在这份词表里【有标签】，ja/ko/ru/th/vi 与一个 other 类，见下面 dict_txt），放行的那趟主链反而【不挂】前置判别器（--lid-backend off）。批内前置筛子（--lid-backend firered，即下面 firered_lid_q4_k 那件，每文件只看前 5 秒）现在是【降级档】：ASR_LID_ROUTER=sieve 显式用它，或路由那组权重/ffmpeg 缺失时起批前自动降回它；兜底那趟 crispasr 照样挂它（qwen3 的 -l 会被拼进 assistant 前缀，没有判别器就等于把筛子的错误固化）。本包 onnx/ 里的 FireRedASR2S ONNX 全链路（FireRedVAD→AED→FireRedPunc，纯 onnxruntime，三个会话进程内常驻）仍是【可切换的另一条腿】：设 ASR_PRIMARY_LEG=onnx 就改走它，那条腿的语种由语种闸门判（silero VAD 导段 + whisper-tiny -dl），帧级路由不作用于它。onnxruntime 用的是本包 env/ 里那份，不去动系统 python 的 ort；路由那趟落在 CPU（lid_onnx.py 建会话时 providers 写死 CPUExecutionProvider）。",
+ "note": "主引擎 FireRedASR2-AED + 兜底 qwen3 的双引擎驱动。出厂默认 PRIMARY_LEG=\"crispasr\"：主力那一路就是 crispasr.exe 的 firered-asr 后端。10-16 起换引擎的判据默认由【帧级语种路由】给出（LID_ROUTER=\"frame\"，README §7）：整条音频在 crispasr 之外过一遍 FireRedLID 的 ONNX（下面 frame_lid_build 那一组），按 VAD 子段计票，判到 AED 覆盖范围外的语种满 3 段才把那个文件扣下换 qwen3（范围外的语言在这份词表里【有标签】，ja/ko/ru/th/vi 与一个 other 类，见下面 dict_txt），放行的那趟主链反而【不挂】前置判别器（--lid-backend off）。批内前置筛子（--lid-backend firered，即下面 firered_lid_f16 那件，每文件只看前 5 秒）现在是【降级档】：ASR_LID_ROUTER=sieve 显式用它，或路由那组权重/ffmpeg 缺失时起批前自动降回它；兜底那趟 crispasr 照样挂它（qwen3 的 -l 会被拼进 assistant 前缀，没有判别器就等于把筛子的错误固化）。本包 onnx/ 里的 FireRedASR2S ONNX 全链路（FireRedVAD→AED→FireRedPunc，纯 onnxruntime，三个会话进程内常驻）仍是【可切换的另一条腿】：设 ASR_PRIMARY_LEG=onnx 就改走它，那条腿的语种由语种闸门判（silero VAD 导段 + whisper-tiny -dl），帧级路由不作用于它。onnxruntime 用的是本包 env/ 里那份，不去动系统 python 的 ort；路由那趟落在 CPU（lid_onnx.py 建会话时 providers 写死 CPUExecutionProvider）。",
  "frame_lid_build": {
   "kind": "build artifacts",
   "root": "onnx/models",
-  "paths": ["FireRedLID-onnx/lid_encoder.onnx", "FireRedLID-onnx/lid_encoder.onnx.data",
-            "FireRedLID-onnx/lid_decoder_step.onnx", "FireRedLID-onnx/lid_decoder_step.onnx.data",
-            "FireRedLID/dict.txt", "FireRedLID/cmvn.ark"],
+  "paths": [
+   "FireRedLID-onnx/lid_encoder.onnx",
+   "FireRedLID-onnx/lid_encoder.onnx.data",
+   "FireRedLID-onnx/lid_decoder_step.onnx",
+   "FireRedLID-onnx/lid_decoder_step.onnx.data",
+   "FireRedLID/dict.txt",
+   "FireRedLID/cmvn.ark"
+  ],
   "bytes_two_graphs_plus_data": 3552376747,
   "dict_txt": {
-    "path": "FireRedLID/dict.txt",
-    "bytes": 779,
-    "sha256": "23ef00941731a24c0b547ab3db69387be2a9d203e4f84a61008a6ab20df1f78b",
-    "labels_total": 120,
-    "breakdown": "5 个特殊位（<blank> <unk> <pad> <sos> <eos>）+ 8 个汉语位（zh 与其 7 个方言 token：mandarin xinan min wu xiang yue north）+ 107 个其他（102 个两字母码、4 个三字母码、外加一个真实的 other 类）",
-    "out_of_range_examples": "ja=11 ko=12 ru=13 th=83 vi=90，以及 other=9",
-    "grade": "A（10-16 在校机上 Get-FileHash 与本地逐字节相同的副本都算过；标签清单是逐行读出来的）",
-    "note": "判别器的输出词表 —— 【范围外语言在这里是有标签的】，所以换引擎的判据不需要另找语种模型。词表里有 ja 不等于判得准：本语料上的召回一个数都没有（C），最伤的失手方向是把日语判成 zh ⇒ 判进范围内、交给 AED 用汉字编造，这一层路由收不住。详见 README §7.6。"
+   "path": "FireRedLID/dict.txt",
+   "bytes": 779,
+   "sha256": "23ef00941731a24c0b547ab3db69387be2a9d203e4f84a61008a6ab20df1f78b",
+   "labels_total": 120,
+   "breakdown": "5 个特殊位（<blank> <unk> <pad> <sos> <eos>）+ 8 个汉语位（zh 与其 7 个方言 token：mandarin xinan min wu xiang yue north）+ 107 个其他（102 个两字母码、4 个三字母码、外加一个真实的 other 类）",
+   "out_of_range_examples": "ja=11 ko=12 ru=13 th=83 vi=90，以及 other=9",
+   "grade": "A（10-16 在校机上 Get-FileHash 与本地逐字节相同的副本都算过；标签清单是逐行读出来的）",
+   "note": "判别器的输出词表 —— 【范围外语言在这里是有标签的】，所以换引擎的判据不需要另找语种模型。词表里有 ja 不等于判得准：本语料上的召回一个数都没有（C），最伤的失手方向是把日语判成 zh ⇒ 判进范围内、交给 AED 用汉字编造，这一层路由收不住。详见 README §7.6。"
   },
   "grade": "A（10-06 在校机上逐件算的字节与 sha256，表在 cpu 分支 FireRed-ONNX/README.md 的导出那一节）",
-  "note": "帧级路由（LID_ROUTER=\"frame\"）的判别器权重，也是【本清单里唯一不进下载 URL 的一组】：全网没有 FireRedLID 的现成 ONNX，要 torch + clone FireRedASR2S + 官方 model.pth.tar，再跑 onnx/optional-lid/lid_export.py 与 lid_export_dec.py 自己导。两个 .onnx.data 是 external data，路径存在不代表内容完整，所以 frame_router_setup() 查的是『能不能建成会话』而不是文件名。校机的 models 下已有整套；笔记本上没有 —— 在那儿起批会在日志里点名缺哪几条路径，然后把整条路由降级成 firered_lid_q4_k 那个批内筛子。另外这条腿还额外要求一个能跑的 ffmpeg 可执行文件（libsndfile 不认 m4a / mp4 / aac，而小红书下载的封装主要是这一类）：探测不过同样整条降级，详见 README §7.4。"
+  "note": "帧级路由（LID_ROUTER=\"frame\"）的判别器权重，也是【本清单里唯一不进下载 URL 的一组】：全网没有 FireRedLID 的现成 ONNX，要 torch + clone FireRedASR2S + 官方 model.pth.tar，再跑 onnx/optional-lid/lid_export.py 与 lid_export_dec.py 自己导。两个 .onnx.data 是 external data，路径存在不代表内容完整，所以 frame_router_setup() 查的是『能不能建成会话』而不是文件名。校机的 models 下已有整套；笔记本上没有 —— 在那儿起批会在日志里点名缺哪几条路径，然后把整条路由降级成 firered_lid_f16 那个批内筛子。另外这条腿还额外要求一个能跑的 ffmpeg 可执行文件（libsndfile 不认 m4a / mp4 / aac，而小红书下载的封装主要是这一类）：探测不过同样整条降级，详见 README §7.4。"
  },
  "onnx_chain": {
   "code": "onnx/（asr_chain.py + aed_ort.py + models/fireredvad-onnx/infer_onnx.py + dequant_*.py）",
@@ -208,16 +213,16 @@
    "note": "书面标点后处理，【只给 AED 引擎用】（qwen3 自己出标点）。这一件必须给本地路径：留空时 crispasr 会取 auto 并联网去下 FireRedPunc（crispasr_run.cpp:3940），拉不动的机器上每批白等一次超时。"
   },
   {
-   "name": "firered_lid_q4_k",
+   "name": "firered_lid_f16",
    "kind": "file",
    "root": "model",
-   "path": "firered-lid-q4_k.gguf",
-   "url": "https://huggingface.co/cstr/firered-lid-GGUF/resolve/main/firered-lid-q4_k.gguf",
-   "bytes": 569688704,
-   "sha256": "f83eee40c5c00c5de4cca52c91a60c3fcf8608851d44ef0e841fdb2e569770c2",
+   "path": "firered-lid-f16.gguf",
+   "url": "https://huggingface.co/cstr/firered-lid-GGUF/resolve/main/firered-lid-f16.gguf",
+   "bytes": 1814794560,
+   "sha256": "f441cf09eb8fa1dc0657ca81aee36572636656e6077375058ce807496566ca7f",
    "grade": "A",
    "license": "Apache-2.0（FireRedLID 上游，模型卡 license 字段原文 apache-2.0；量化件由 cstr 侧发布，卡片明写『format conversion and/or quantisation only』）",
-   "note": "批内语种筛子（驱动 CONFIG 里的 CRISPASR_LID_MODEL，拼成 --lid-backend firered --lid-model <这件>）。10-16 起它的地位变了：出厂默认 LID_ROUTER=\"frame\" 那条路上【主链不挂它】（_crispasr_batch 用 lid_off=True），它只在三种情形下参与拼命令 —— ①降级档（ASR_LID_ROUTER=sieve，或路由那组权重/ffmpeg 缺失时被 frame_router_setup 自动降回来）②兜底那趟 qwen3（无论哪种路由都挂）③PRIMARY_LEG=onnx 的兜底腿。所以这件从『必需』变成『降级与兜底都要用，仍然要下齐』。两条腿都要它。sha256 = HuggingFace 的 LFS oid（10-14 重新 curl api/models/cstr/firered-lid-GGUF/tree/main 直读：q4_k 569,688,704 / f83eee40…、f16 1,814,794,560 / f441cf09eb8fa1dc0657ca81aee36572636656e6077375058ce807496566ca7f、q8_0 1,002,769,024 / 416d3e431e6e20bd78e78e545ad6b91fe40d254ac66190d36a4d9127e66aebdb、q2_k 366,864,704 / 090274b59a2132450fe28a1ba725e4b1f4a099c4eca0ae1e73fcd51b9a4575d6、firered-lid.gguf(F16) 1,814,794,816 / eb26a7f3b4daa6fd0e7939a0ee3f7e442e72f2df20e73f5057838f53e816b555），换档只改 path/bytes/sha256 三行。选 q4_k 的依据：CrispASR 主 README 的 LID 那一节把这个模型记作『Q4_K (544 MB), 120 languages including Chinese dialects. Slower but covers more languages』（README.md:611；543 MB 对上 569,688,704 B，那句 Slower 是上游原话），而 crispasr_lid_cli.cpp:57-59 里 --lid-backend firered 不给 --lid-model 时自动去下的默认件是 f16（1.7 GB，同 README:493）—— 8 GB 显存的机器上按最便宜够用取 q4_k。⚠ 代价没量过：firered_lid_init 走 firered_asr 默认参数（src/firered_lid.cpp:50-54），那份参数 use_gpu=true（src/firered_asr.cpp:297），而 crispasr_run.cpp:1029 每文件调 crispasr_lid_free_cache()（#35 显存修补），所以这件 543 MB 是【每个文件重装一次、且上显卡】；whisper-tiny 那件是 77 MB。另外它的判别窗口比 whisper 更短（15 s 截断 ∩ src/firered_lid.cpp:78 的 5 s 截断 = 前 5 秒），置信度恒 1.0（同文件 :90 写死），本语料召回未测。"
+   "note": "批内语种筛子（驱动 CONFIG 里的 CRISPASR_LID_MODEL，拼成 --lid-backend firered --lid-model <这件>）。10-16 起出厂档从 q4_k 换成 f16，也就是 crispasr 自己的默认口径：注册表 lid-firered 那一行（src/crispasr_model_registry.cpp:1467-1474）与 --lid-backend firered 不给 --lid-model 时自动下的那件（examples/cli/crispasr_lid_cli.cpp:58-59）都指 f16；而官方转换器 models/convert-firered-lid-to-gguf.py 只有 --input/--output 两个参数、权重一律按 float16 落盘（:146、:168），所以 f16 是【转换产物本身】，其余几档是 cstr 侧的量化件。换小档在这条路上【拿不到计算收益】：上游 docs/ggml-optimisation-playbook.md:539-545 实测，AVX2 的 EPYC 7763 上 q8_0 整个模型比 f32 还慢 9%（1.09×），要拿到 0.72× 得靠 repack，而 repack 在 crispasr 里只接到 whisper（src/crispasr.cpp:1925-1937）与 hFT（src/hft_transformer.cpp:391）两处，FireRedLID 这条 backend 走不到，repack.cpp:4528 在 x86 上连 q8_0 分支都没有 ⇒ 量化省下的只是磁盘和『每文件重装』的搬运体积，不是算力。f16 对 q4_k 的算力差、以及『无损』对判据精度的影响，两条都【没量过】（标 C）。地位（10-16 起）：出厂默认 LID_ROUTER=\"frame\" 那条路上【主链不挂它】（_crispasr_batch 用 lid_off=True），它只在三种情形下参与拼命令 —— ①降级档（ASR_LID_ROUTER=sieve，或路由那组权重/ffmpeg 缺失时被 frame_router_setup 自动降回来）②兜底那趟 qwen3（无论哪种路由都挂）③PRIMARY_LEG=onnx 的兜底腿。代价：firered_lid_init 走 firered_asr 默认参数（src/firered_lid.cpp:50-54），那份参数 use_gpu=true（src/firered_asr.cpp:297），而 crispasr_run.cpp:1029 每文件调 crispasr_lid_free_cache()（#35 显存修补），所以这 1.81 GB 是【每个文件重装一次、且上显卡】；8 GB 显存的机器按最便宜够用取 q4_k（569,688,704 B / f83eee40…），换档只改 path/bytes/sha256 三行。上游主 README 有两处可对照的口径：:634 把 q4_k 那档记作『Q4_K (544 MB), 120 languages including Chinese dialects. Slower but covers more languages』（那句 Slower 与上面②同向 —— 上游也没把量化件当快的），:516 把 --lid-backend firered 的自动下载件记作 1.7 GB（= f16，与①同向）。两处是 10-16 直读上游当日的行号；10-14 记的 :611 / :493 已随上游漂移，作废。判别窗口比 whisper 更短（15 s 截断 ∩ src/firered_lid.cpp:78 的 5 s 截断 = 前 5 秒），置信度恒 1.0（同文件 :90 写死），本语料召回未测。五档 sha256（10-14 curl api/models/cstr/firered-lid-GGUF/tree/main 直读；f16 那一件 10-16 又在生产机的模型目录里下载后逐字节核过，与 LFS oid 相同）：f16 1,814,794,560 / f441cf09eb8fa1dc0657ca81aee36572636656e6077375058ce807496566ca7f、q4_k 569,688,704 / f83eee40c5c00c5de4cca52c91a60c3fcf8608851d44ef0e841fdb2e569770c2、q8_0 1,002,769,024 / 416d3e431e6e20bd78e78e545ad6b91fe40d254ac66190d36a4d9127e66aebdb、q2_k 366,864,704 / 090274b59a2132450fe28a1ba725e4b1f4a099c4eca0ae1e73fcd51b9a4575d6、firered-lid.gguf(F16) 1,814,794,816 / eb26a7f3b4daa6fd0e7939a0ee3f7e442e72f2df20e73f5057838f53e816b555（最后这件与 f16 差 256 B，是另一次转换的产物，别混用）。"
   },
   {
    "kind": "file",
@@ -228,7 +233,7 @@
    "sha256": "be07e048e1e599ad46341c8d2a135645097a538221678b7acdd1b1919c6e1b21",
    "grade": "A",
    "license": "MIT（whisper.cpp）",
-   "note": "10-14 起它【只服务语种闸门的第 2 步】：PRIMARY_LEG=\"onnx\" 时驱动用它跑 -dl 判语种（驱动 CONFIG 里的 GATE_WHISPER_MODEL，闸门每个待判文件调一次）。批内筛子已经不是它了 —— 换成了 firered_lid_q4_k 那件（CRISPASR_LID_MODEL），所以默认腿 crispasr 下这件【不参与拼命令】、onnx_leg_setup 也不检查它。为什么闸门还留着 whisper-tiny 而不跟筛子统一:-dl 那条「判完就退出」的早退和 auto-detected language 那行都是 whisper 引擎特有的（src/crispasr.cpp:7953-7970），FireRedLID 走 -dl 不产生判别行。切到 onnx 腿之前必须把它下齐（给成本地文件，否则 crispasr 会去联网下、离线机器上卡满超时）。",
+   "note": "10-14 起它【只服务语种闸门的第 2 步】：PRIMARY_LEG=\"onnx\" 时驱动用它跑 -dl 判语种（驱动 CONFIG 里的 GATE_WHISPER_MODEL，闸门每个待判文件调一次）。批内筛子已经不是它了 —— 换成了 firered_lid_f16 那件（CRISPASR_LID_MODEL），所以默认腿 crispasr 下这件【不参与拼命令】、onnx_leg_setup 也不检查它。为什么闸门还留着 whisper-tiny 而不跟筛子统一:-dl 那条「判完就退出」的早退和 auto-detected language 那行都是 whisper 引擎特有的（src/crispasr.cpp:7953-7970），FireRedLID 走 -dl 不产生判别行。切到 onnx 腿之前必须把它下齐（给成本地文件，否则 crispasr 会去联网下、离线机器上卡满超时）。",
    "name": "whisper_tiny_lid"
   },
   {

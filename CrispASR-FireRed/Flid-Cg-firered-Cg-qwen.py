@@ -53,8 +53,9 @@ CrispASR 批量转写驱动(Windows) —— FireRed AED 主引擎 + qwen3 兜底
     仍然成立的部分:判成 zh 的外语文件会被 AED 编造一段话并正常落盘,这一层没有兜底;
     假阳性的代价只是白跑一遍 qwen3(它反而快 5 倍)。
     前置判别每文件都要重装一次筛子模型(crispasr_run.cpp:1029 的 crispasr_lid_free_cache()
-    是 #35 显存修补)。代价变了:whisper-tiny 那份 77 MB,FireRedLID q4_k 这份 543 MB
-    —— 每文件重装的东西大了 7 倍,而【这个开销没有量过】,见 CONFIG · 语种。
+    是 #35 显存修补)。代价变了:whisper-tiny 那份 77 MB,FireRedLID 这份按档位是
+    f16 1.81 GB(出厂默认)/ q4_k 543 MB(笔记本档)—— 每文件重装的东西大了 7-24 倍,
+    而【这个开销没有量过】,见 CONFIG · 语种。
     它默认还占显存:firered_lid_init 走 firered_asr 的默认参数,那份参数里 use_gpu = true
     (src/firered_asr.cpp:297)。
   · VAD 用 FireRedVAD(2,357,952 B)—— 小红书自家模型,FireRedASR2S 把唱歌算进 voice,
@@ -202,9 +203,23 @@ CRISPASR_MODEL_AED = os.path.join(MODEL_DIR, "firered-asr2-aed-q4_k.gguf")
 CRISPASR_MODEL_QWEN3 = os.path.join(MODEL_DIR, "qwen3-asr-1.7b-q8_0.gguf")
 # 书面标点后处理,【只给 AED 用】(qwen3 自己出标点,理由见 CONFIG · 引擎)。
 CRISPASR_PUNC_MODEL = os.path.join(MODEL_DIR, "fireredpunc-q8_0.gguf")
-# FireRedLID 前置语种判别器(firered-lid-q4_k.gguf,569,688,704 B)。当筛子用,
-# 见 CONFIG · 语种。同目录另有 f16/q8_0/q2_k 三档,换档只改这一行(哈希记在 assets.json)。
-CRISPASR_LID_MODEL = os.path.join(MODEL_DIR, "firered-lid-q4_k.gguf")
+# FireRedLID 前置语种判别器,取 f16(firered-lid-f16.gguf,1,814,794,560 B)。三条理由:
+# ① 它是 crispasr 自己的默认口径 —— 注册表 lid-firered 那一行(src/crispasr_model_registry.cpp:1472)
+#    和 `--lid-backend firered` 不给 `--lid-model` 时自动下的那件(examples/cli/crispasr_lid_cli.cpp:58-59)
+#    都是 f16;而且官方转换器 models/convert-firered-lid-to-gguf.py 只有 --input/--output 两个参数,
+#    权重一律 astype(np.float16) 落盘(:146、:168)⇒ f16 是【转换产物本身】,其余几档是 cstr 侧的量化件。
+# ② 量化在这条路上【拿不到计算收益】。上游 docs/ggml-optimisation-playbook.md:539-545 的实测:
+#    AVX2 的 EPYC 7763 上 q8_0 整个模型比 f32 还慢 9%(1.09×),要拿到 0.72× 得靠 repack;
+#    而 repack 在 crispasr 里只接到 whisper(src/crispasr.cpp:1925-1937)与 hFT
+#    (src/hft_transformer.cpp:391)两处,FireRedLID 这条 backend 走不到,repack.cpp:4528 在 x86 上
+#    更是连 q8_0 分支都没有。⇒ 换小档省下的只是磁盘和"每文件重装"的搬运体积,不是算力
+#    (f16 对 q4_k 的算力差在这条路上【没量过】,标 C)。
+# ③ 判据本身没有置信度闸门可用(p= 恒 1.0,src/firered_lid.cpp:90 写死),精度只能靠权重保真,
+#    无损档在这点上不欠账(这条是定性判断,同样【没量过】)。
+# 代价:sieve 降级档与 qwen3 兜底趟每文件重装 1.81 GB(默认腿是 frame 路由,主链那趟不挂它)。
+# 换档只改下面这一行(五档哈希都记在 assets.json 那条 note 里);8 GB 显存的机器取
+# firered-lid-q4_k.gguf(569,688,704 B)—— 筛子默认 use_gpu=true,峰值那 1.81 GB 会压在显存上。
+CRISPASR_LID_MODEL = os.path.join(MODEL_DIR, "firered-lid-f16.gguf")
 # whisper-tiny(77,691,713 B)现在【只服务语种闸门的第二条腿】:PRIMARY_LEG="onnx" 时
 # 用 `-m 它 -dl` 判语种。原因是 `-dl` 那条早退只在 whisper 引擎里实现
 # (src/crispasr.cpp:7953-7970,detect 完直接 return 0),换 FireRedLID 做闸门判不了。
@@ -575,12 +590,14 @@ CRISPASR_LANGUAGE = "auto"
 #     会调 crispasr_lid_free_cache() 释放(crispasr_run.cpp:1027-1028 注释,那是 #35 显存 OOM
 #     的修补)—— 也就是说这个缓存在批内【每个文件都要重建一次】,不是我原先写的"每批一次"。
 #     whisper-tiny 那版量到 45 s 组 +1.8 s/文件、120 s 组不复现(第 (5) 条)。
-#     ⚠ 换 firered 后每文件重装的东西从 77 MB 变成 543 MB(q4_k),驱动还设了
+#     ⚠ 换 firered 后每文件重装的东西从 77 MB 变成整份 LID 权重(f16 1.81 GB,出厂默认;
+#     笔记本档 q4_k 是 543 MB),驱动还设了
 #     CRISPASR_GGUF_MMAP=0(不走 mmap 就整份读进内存)—— 【这个开销没量过】,
 #     第一次跑生产批次时看日志里每文件的判别耗时就知道了。
 #     它还要显存:firered_lid_init 用的是 firered_asr_context_default_params()
 #     (src/firered_lid.cpp:50-54),那份默认参数里 use_gpu = true(src/firered_asr.cpp:297),
-#     所以筛子是按"编码器上 GPU"的方式加载的 —— 8 GB 卡上峰值多出 543 MB,发生在主模型
+#     所以筛子是按"编码器上 GPU"的方式加载的 —— 8 GB 卡上峰值多出整份权重的体积
+#     (f16 1.81 GB / q4_k 543 MB,这就是笔记本那份取 q4_k 的理由),发生在主模型
 #     分配【之前】,跑完立即由 crispasr_lid_free_cache() 释放(#35 就是为这个加的)。
 #   · 判据本身别当尺子用:窗口只有【前 5 秒】原始音频(第 (6) 条:15 秒截断 ∩
 #     firered_lid.cpp:78 的 5 秒截断)—— 片头音乐会把语种定错,这条比 whisper 更糟;
@@ -750,8 +767,8 @@ BATCH_POLL_SEC = 30
 #     中文必撞 150 顶,见上面那段实测),翻到 onnx 腿后它才降级成"标点分段的粒度",
 #     那时 20 与 30 都不丢内容。别因为"ONNX 不撞顶"把它调回 30 又留着 crispasr 腿。
 # 切到 onnx 腿时你付出:多一套 python 依赖(onnxruntime,要 GPU 还得有 CUDA EP 那份解释器
-#   ⇒ 下面的 GPU_PY 自换机制【只在 PRIMARY_LEG="onnx" 时才会触发】,默认腿是 crispasr 时
-#   一行 ORT 都不碰),以及下面那段语种闸门(它【只在 onnx 腿跑】,判语种要用 crispasr 的
+#   ⇒ 下面的 GPU_PY 自换机制【只在 PRIMARY_LEG="onnx" 时才会触发】。默认腿 crispasr 会 import
+#   ORT(帧级路由那趟,落 CPU)但不碰它),以及下面那段语种闸门(它【只在 onnx 腿跑】,判语种要用 crispasr 的
 #   `-dl` 早退,而那条早退只在 whisper 引擎里实现 —— 所以闸门用的判别模型是
 #   GATE_WHISPER_MODEL 那份 ggml-tiny.bin,不是批内筛子的 FireRedLID)。
 #
@@ -815,7 +832,8 @@ ONNX_PUNC_FILE = os.environ.get("FIREDASR_ONNX_PUNC_FILE", "")   # 空 = 先 pun
 #
 # 代价(这条【没量过】,每个文件都在日志里打秒数,第一批跑完就有数):
 #   · 会话常驻 = 编码器 + 解码器两张图的 external data 一次读进本进程,换来的是不再有 sieve
-#     那个"每个文件重装一遍 543 MB" —— crispasr_run.cpp:1029 每个文件都调
+#     那个"每个文件重装一遍整份 LID 权重"(默认档 f16 = 1.81 GB,笔记本档 q4_k = 543 MB)
+#     —— crispasr_run.cpp:1029 每个文件都调
 #     crispasr_lid_free_cache()(那是 #35 显存 OOM 的修补),而路由这趟跑在 crispasr 之外,
 #     主模型的显存分配与它无关。
 #   · 每个文件多一次整条音频的编码。跑在 CPU 上:lid_onnx.py 建会话时 providers 写死
@@ -1424,7 +1442,7 @@ def _sieve_off_for_primary(engine: str) -> bool:
     """主链那趟的命令要不要【不挂】前置判别器。
 
     判据是"它的结论有没有人用":筛子不生效的两种方式(frame / off)都没人用,留着只白付
-    一次 crispasr_run.cpp:1029 那个每文件重装 543 MB 的重载。
+    一次 crispasr_run.cpp:1029 那个每文件重装整份 LID 权重的重载。
     兜底引擎(engine != ENGINE_PRIMARY)永远要挂 —— qwen3 是真吃 -l 的。
     """
     return engine == ENGINE_PRIMARY and _router() != "sieve"
@@ -1554,7 +1572,7 @@ def _base_cmd(engine: str = ENGINE_PRIMARY, lid_off: bool = False):
     其余(VAD、分块、-l auto、前置判别、严格管线)完全一致 —— 差别写在 ENGINES 里。
 
     lid_off=True 时前置判别器不挂(--lid-backend off)。只有帧级路由下的【主链那趟】这么给:
-    文件早就按整条音频挑完了,再挂 543 MB 的筛子只会多一份每文件重载(crispasr_run.cpp:1029
+    文件早就按整条音频挑完了,再挂整份 LID 权重的筛子只会多一份每文件重载(crispasr_run.cpp:1029
     每个文件都 free_cache 一次)。兜底那趟【不能】传它 —— qwen3 是【真】吃 -l 的
     (crispasr_backend_qwen3.cpp:180-184 把语种码拼进 assistant 前缀),前置判别器给的码就是
     它那趟的语种输入;AED 反过来根本不吃这个标记,所以关掉它对主链的输出没有任何影响。
@@ -2472,7 +2490,7 @@ def transcribe_batch_frame(files: list, on_done=None, engine: str = ENGINE_PRIMA
     为什么不像筛子那样"照样喂、再把输出扣掉":筛子只能在 crispasr 进程里判,拦不住已经开跑
     的转写;这里的判据在 crispasr 之外,先判完再决定,就白省一趟注定是编造内容的转写。
     放行的那部分走 _crispasr_batch(lid_off=True) —— 主链那趟不挂前置判别器了,顺带省掉
-    crispasr_run.cpp:1029 那个每文件重装一遍 543 MB 的开销。
+    crispasr_run.cpp:1029 那个每文件重装一遍整份 LID 权重的开销。
 
     返回与 _crispasr_batch 同一份契约,process_batch 的形状不用改:
       results 里 = AED 已产出;flagged 里 = 待兜底;两处都没有 = 未产出,逐文件重跑。
