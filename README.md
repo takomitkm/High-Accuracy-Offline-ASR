@@ -108,11 +108,11 @@
 驱动进程里常驻一份 FireRedLID 的 ONNX（纯 onnxruntime，建会话时 providers 写死
 `CPUExecutionProvider`），先把整条音频按 VAD 切段、长段再按 6 s 切成子段，每子段用 3 s 窗 /
 1.5 s 跳投票，范围外的**段数 / 时长 / 占语音比例三条一起过线**（≥2 子段、≥`min(15 s, 语音时长/2)`、
-≥1/4）才把整个文件扣下来换 qwen3；放行的那趟主链反而
+≥0.15）才把整个文件扣下来换 qwen3；放行的那趟主链反而
 【不挂】crispasr 的前置判别器（`--lid-backend off`）。非换不可的理由是 crispasr 那个批内
 判别器结构上只能看头 5 秒、置信度又写死 1.0，"整个文件都在/都不在范围内"这句话它给不出
-（判据、分块代价与三条降级全在该目录 README §7；10-17 在校机沙箱排完的召回实测在 §7.5，
-同一天对上游 `--lid-backend ecapa` 的评估在 §7.7，结论不换）。
+（判据、分块代价与三条降级全在该目录 README §7；10-17 在校机沙箱排完的召回实测在 §7.5，出厂占比线就是
+据它当晚由 0.25 定为 0.15（`abs` 15 s 未动）；同一天对上游 `--lid-backend ecapa` 的评估在 §7.7，结论不换）。
 10-14 那版**批内的前置判别器**（"筛子"）现在是**降级档**（`ASR_LID_ROUTER=sieve` 显式用，
 或路由那组权重 / ffmpeg 缺失时被 `frame_router_setup()` 起批前自动降回）：一趟
 `--lid-backend firered --lid-model firered-lid-f16.gguf`，每个文件往 stderr 打一行
