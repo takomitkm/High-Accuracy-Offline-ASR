@@ -823,7 +823,7 @@ ONNX_PUNC_FILE = os.environ.get("FIREDASR_ONNX_PUNC_FILE", "")   # 空 = 先 pun
 # 而"范围外子段数 ≥ 3"这一条【只看分子】,两头都错:一条 12 s 的日语独白切不出 3 个子段
 # (6 s 一刀,只有 2 段),永远够不到那条线 —— 而它正是要抓的那类文件;反过来一条 5 分钟的
 # 中文视频,片头 3 个子段被判成外语(18 s / 300 s = 6%)就把整条换引擎。10-17 换成
-# 占比满 1/4、绝对量满 min(15 s, 语音时长的一半)、且至少 2 个子段(除非有票的子段全在范围外)。
+# 占比满 0.15(出厂线,10-17 晚从 1/4 降下来,理由与饱和度在 README §7.5 九)、绝对量满 min(15 s, 语音时长的一半)、且至少 2 个子段(除非有票的子段全在范围外)。
 # 假阳性确实便宜(兜底那趟 0.19 RTF,比 AED 快 5 倍),所以三条的门槛都定得不高 ——
 # 但假阴性仍然在:判成 zh 的外语文件照样被 AED 用汉字编造并正常落盘,这一层没有任何东西收得住 ——
 # 帧级改的是【看到多少音频】,不是【判得准不准】。
@@ -832,7 +832,7 @@ ONNX_PUNC_FILE = os.environ.get("FIREDASR_ONNX_PUNC_FILE", "")   # 空 = 先 pun
 # 一条十分钟的日语独白在 VAD 下常常就一两段(10-09 校机实测 80.2 s 素材的段表只有一条
 # 0.03–79.55 s,记在 _speech_prefix 里),不切子段的话短素材会被一整段吞掉、
 # 长素材的局部误判会被当成整条的证据;而不扣 VAD 空段的话,"半句话＋两分钟静音"的素材
-# 会把占比的分母撑虚,谁也都过不了 1/4。
+# 会把占比的分母撑虚,谁也都过不了占比线。
 #
 # VAD 用的是 CRISPASR_VAD_MODEL(FireRedVAD),不是语种闸门那份 silero:silero v6.2.0 对唱歌素材
 # 判 0 段(依据见 CONFIG · VAD 那组数字),而唱歌正是最需要换引擎的那片;FireRedVAD 与主引擎同源,
@@ -869,7 +869,7 @@ ONNX_PUNC_FILE = os.environ.get("FIREDASR_ONNX_PUNC_FILE", "")   # 空 = 先 pun
 # 只在 PRIMARY_LEG="crispasr" 时生效。onnx 腿的语种闸门(silero + whisper-tiny -dl)原样不动,
 # 它本来就只在 onnx 腿跑;把闸门也换成帧级是后续的事,现在改它等于动一条已经跑过生产的路由。
 LID_ROUTER = (os.environ.get("ASR_LID_ROUTER") or "frame").strip().lower()
-FRAME_LID_BAD_FRAC = float(os.environ.get("FIREDASR_LID_BAD_FRAC") or 0.25)
+FRAME_LID_BAD_FRAC = float(os.environ.get("FIREDASR_LID_BAD_FRAC") or 0.15)
 FRAME_LID_BAD_HALF = float(os.environ.get("FIREDASR_LID_BAD_HALF") or 0.5)
 FRAME_LID_BAD_ABS_SEC = float(os.environ.get("FIREDASR_LID_BAD_ABS_SEC") or 15.0)
 FRAME_LID_UNIT_SEC = float(os.environ.get("FIREDASR_LID_UNIT_SEC") or 6.0)
@@ -2432,7 +2432,7 @@ def frame_route(src: str):
     按 FRAME_LID_SLICE_SEC 打包整段编码 + 滑窗解码 + 按子段汇票(后两步直接复用
     onnx/asr_chain.py 的 run_lid,与单文件跑 --lid 时同一条实现,不另写一份)。
     判据是三条一起:范围外的【子段数】≥2(或有票的子段全在范围外)、【时长】≥min(15 s, 语音时长的一半)、
-    【占比】≥1/4。为什么不再只数段数,见 CONFIG · 帧级语种路由(LID_ROUTER)那一段。
+    【占比】≥FRAME_LID_BAD_FRAC(出厂 0.15)。为什么不再只数段数,见 CONFIG · 帧级语种路由(LID_ROUTER)那一段。
 
     votes=0 与 votes>0 但不路由是两件完全不同的事,日志必须分得开:
       · votes>0 而范围外子段不够门限 —— 整条基本在 AED 能判的范围里,正常放行;
